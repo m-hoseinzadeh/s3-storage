@@ -63,7 +63,7 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
         (&Method::POST, ["object", "copy"]) => copy_object(state, body, false).await,
         (&Method::POST, ["object", "move"]) => copy_object(state, body, true).await,
         (&Method::POST, ["object", "metadata"]) => update_metadata(state, body).await,
-        (&Method::GET, ["object", "presign"]) => presign_object(state, &query, &headers),
+        (&Method::GET, ["object", "presign"]) => presign_object(state, &query),
         (&Method::DELETE, ["object"]) => delete_object(state, &query).await,
 
         (&Method::POST, ["folder"]) => create_folder(state, body).await,
@@ -440,7 +440,7 @@ async fn update_metadata(state: &AdminState, body: Body) -> Result<S3Response<Bo
 
 // ---- presign ----
 
-fn presign_object(state: &AdminState, q: &Query, headers: &HeaderMap) -> Result<S3Response<Body>, ApiError> {
+fn presign_object(state: &AdminState, q: &Query) -> Result<S3Response<Body>, ApiError> {
     let bucket = q.require("bucket")?;
     let key = q.require("key")?;
     let method = q.opt("method").unwrap_or_else(|| "GET".to_owned()).to_uppercase();
@@ -449,25 +449,24 @@ fn presign_object(state: &AdminState, q: &Query, headers: &HeaderMap) -> Result<
     }
     let expires = q.opt("expires").and_then(|s| s.parse::<u64>().ok()).unwrap_or(3600).clamp(1, 604_800);
 
-    // The presigned URL must target the S3 API host that clients actually reach.
-    // Prefer the configured public API URL; otherwise fall back to this request's
-    // own Host (correct only when the admin and API share a host).
-    let (scheme, host) = match state.api_public_url.as_deref().map(split_scheme_host) {
-        Some((scheme, host)) => (scheme.to_owned(), host.to_owned()),
-        None => {
-            let host = headers
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| ApiError::bad_request("missing Host header"))?;
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("http");
-            (scheme.to_owned(), host.to_owned())
-        }
-    };
+    // A SigV4 presigned URL is signed over its host, and the admin panel sits on a
+    // different port/domain than the S3 API. So the target host must come from the
+    // operator-configured public API URL, never from the (client-controlled, and
+    // here always wrong) request Host header.
+    let base = state.api_public_url.as_deref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NotConfigured",
+            "presigned URLs require the server to be started with S3_API_PUBLIC_URL set to the \
+             public base URL of the S3 API (e.g. https://api.example.com)",
+        )
+    })?;
+    let (scheme, host) = split_scheme_host(base);
+    if host.is_empty() {
+        return Err(ApiError::internal("S3_API_PUBLIC_URL is malformed (no host)"));
+    }
 
-    let url = presign::presign(&state.access_key, &state.secret_key, &scheme, &host, &bucket, &key, &method, expires);
+    let url = presign::presign(&state.access_key, &state.secret_key, scheme, host, &bucket, &key, &method, expires);
     Ok(json_ok(serde_json::json!({ "url": url, "expires_in": expires, "method": method })))
 }
 
