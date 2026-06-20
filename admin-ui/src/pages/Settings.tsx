@@ -1,33 +1,85 @@
-import { useEffect, useState } from "react";
-import { Server, Globe, Link2, KeyRound, Info, BookOpen } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Server, Globe, Link2, KeyRound, Info, BookOpen, Save } from "lucide-react";
 import { api, ApiError, type ServerConfig } from "../lib/api";
-import { Badge, Card, Spinner, useToast } from "../components/ui";
+import { Button, Card, Field, Input, Spinner, useToast } from "../components/ui";
 import { PageHeader, TutList } from "../components/PageHeader";
+
+const toLines = (s: string) =>
+  s
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
 
 export function Settings() {
   const [config, setConfig] = useState<ServerConfig | null>(null);
+  const [publicBuckets, setPublicBuckets] = useState("");
+  const [domains, setDomains] = useState("");
+  const [domainMap, setDomainMap] = useState("");
+  const [apiUrl, setApiUrl] = useState("");
+  const [ttl, setTtl] = useState("");
+  const [saving, setSaving] = useState(false);
   const toast = useToast();
 
-  useEffect(() => {
+  const apply = useCallback((c: ServerConfig) => {
+    setConfig(c);
+    setPublicBuckets(c.public_buckets.join("\n"));
+    setDomains(c.domains.join("\n"));
+    setDomainMap(c.domain_map.join("\n"));
+    setApiUrl(c.api_public_url ?? "");
+    setTtl(c.admin_session_ttl_secs != null ? String(c.admin_session_ttl_secs) : "");
+  }, []);
+
+  const load = useCallback(() => {
     api
       .config()
-      .then(setConfig)
-      .catch((e) => toast("error", e instanceof ApiError ? e.message : "Failed to load config"));
-  }, [toast]);
+      .then(apply)
+      .catch((e) => toast("error", e instanceof ApiError ? e.message : "Failed to load settings"));
+  }, [apply, toast]);
+
+  useEffect(load, [load]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const ttlNum = ttl.trim() === "" ? undefined : Number(ttl);
+      if (ttlNum !== undefined && (!Number.isFinite(ttlNum) || ttlNum <= 0)) {
+        throw new ApiError(400, "BadRequest", "Session TTL must be a positive number of seconds");
+      }
+      await api.updateSettings({
+        public_buckets: toLines(publicBuckets),
+        domains: toLines(domains),
+        domain_map: toLines(domainMap),
+        api_public_url: apiUrl.trim(),
+        admin_session_ttl_secs: ttlNum,
+      });
+      toast("success", "Settings saved");
+      load();
+    } catch (e) {
+      toast("error", e instanceof ApiError ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div>
       <PageHeader
         title="Settings & About"
-        description="Read-only view of the server's runtime configuration and how the admin panel works."
+        description="Edit the server's deployment settings. Changes apply live and persist across restarts."
         tutorial={
           <TutList
             items={[
-              "These values come from the server's CLI flags / environment variables and cannot be changed here.",
-              "To change them, update S3_* variables (or flags) and restart the server.",
-              "Public buckets allow anonymous GET/HEAD; everything else requires credentials or a presigned URL.",
+              "These settings are stored in the server's database and can be changed here — no restart needed.",
+              "Public buckets allow anonymous GET/HEAD on the public port; everything else requires credentials or a presigned URL.",
+              "Virtual-host domains enable <bucket>.<domain> addressing; the custom domain map points a host straight at a bucket.",
+              "Bind address, ports and credentials are still set via S3_* flags / environment variables at startup.",
             ]}
           />
+        }
+        actions={
+          <Button variant="primary" onClick={save} loading={saving} disabled={!config}>
+            <Save className="h-4 w-4" /> Save changes
+          </Button>
         }
       />
 
@@ -36,6 +88,9 @@ export function Settings() {
       ) : (
         <div className="grid gap-4 lg:grid-cols-2">
           <Card className="p-5">
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold">
+              <Server className="h-4 w-4 text-[var(--color-accent)]" /> Server (read-only)
+            </h3>
             <Row icon={Server} label="Server version" value={`s3-storage ${config.version}`} />
             <Row icon={KeyRound} label="Access key" value={config.access_key} mono />
             <Row icon={Link2} label="Admin path" value={config.admin_path} mono />
@@ -45,33 +100,41 @@ export function Settings() {
             <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold">
               <Globe className="h-4 w-4 text-[var(--color-accent)]" /> Public buckets
             </h3>
-            {config.public_buckets.length ? (
-              <div className="flex flex-wrap gap-2">
-                {config.public_buckets.map((b) => (
-                  <Badge key={b} tone="accent">{b}</Badge>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-[var(--color-faint-fg)]">None — all buckets are private.</p>
-            )}
+            <Field label="One bucket name per line" hint="Listed buckets allow anonymous GET/HEAD on the public port.">
+              <TextArea value={publicBuckets} onChange={setPublicBuckets} placeholder={"assets\nuploads"} rows={5} />
+            </Field>
           </Card>
 
           <Card className="p-5">
-            <h3 className="mb-3 text-sm font-semibold">Virtual-host domains</h3>
-            {config.domains.length ? (
-              <ul className="space-y-1 text-sm">{config.domains.map((d) => <li key={d} className="mono">{d}</li>)}</ul>
-            ) : (
-              <p className="text-sm text-[var(--color-faint-fg)]">None configured.</p>
-            )}
-            <h3 className="mb-2 mt-4 text-sm font-semibold">Custom domain map</h3>
-            {config.domain_map.length ? (
-              <ul className="space-y-1 text-sm">{config.domain_map.map((d) => <li key={d} className="mono">{d}</li>)}</ul>
-            ) : (
-              <p className="text-sm text-[var(--color-faint-fg)]">None configured.</p>
-            )}
+            <h3 className="mb-3 text-sm font-semibold">Domains</h3>
+            <Field label="Virtual-host base domains" hint="One per line, e.g. cdn.example.com — enables <bucket>.<domain>.">
+              <TextArea value={domains} onChange={setDomains} placeholder={"cdn.example.com"} rows={4} />
+            </Field>
+            <div className="mt-4">
+              <Field
+                label="Custom domain map"
+                hint="One host=bucket per line, e.g. files.example.com=assets — points a host straight at a bucket."
+              >
+                <TextArea value={domainMap} onChange={setDomainMap} placeholder={"files.example.com=assets"} rows={4} />
+              </Field>
+            </div>
           </Card>
 
           <Card className="p-5">
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold">
+              <Link2 className="h-4 w-4 text-[var(--color-accent)]" /> API & sessions
+            </h3>
+            <Field label="Public API URL" hint="Base URL of the S3 API used to mint presigned links, e.g. https://api.example.com. Leave blank to disable presigning.">
+              <Input value={apiUrl} onChange={(e) => setApiUrl(e.target.value)} placeholder="https://api.example.com" />
+            </Field>
+            <div className="mt-4">
+              <Field label="Admin session lifetime (seconds)" hint="How long a login stays valid. Applies to sessions issued after saving.">
+                <Input value={ttl} onChange={(e) => setTtl(e.target.value)} placeholder="3600" inputMode="numeric" />
+              </Field>
+            </div>
+          </Card>
+
+          <Card className="p-5 lg:col-span-2">
             <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold">
               <BookOpen className="h-4 w-4 text-[var(--color-accent)]" /> About this panel
             </h3>
@@ -84,6 +147,28 @@ export function Settings() {
         </div>
       )}
     </div>
+  );
+}
+
+function TextArea({
+  value,
+  onChange,
+  placeholder,
+  rows,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  rows?: number;
+}) {
+  return (
+    <textarea
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      rows={rows}
+      className="focusable mono w-full rounded-[var(--radius)] bg-[var(--color-bg)] border border-[var(--color-border-strong)] px-3 py-2 text-sm text-[var(--color-fg)] placeholder:text-[var(--color-faint-fg)] transition-colors"
+    />
   );
 }
 

@@ -62,14 +62,18 @@ domain/subdomain (e.g. via nginx):
 |------|---------|--------|------|
 | **API** | `8080` | The full S3 wire protocol for SDK clients (`ListObjects`, `PutObject`, multipart, …). | SigV4 only — **anonymous access is rejected**. |
 | **Admin** | `8081` | The web admin panel + its JSON API, served at the **root** of the port. | Session cookie. |
-| **Public** | `8082` | Anonymous `GET`/`HEAD` of buckets listed in `S3_PUBLIC_BUCKETS`. Ideal for a CDN/asset domain. | None (read-only). |
+| **Public** | `8082` | Anonymous `GET`/`HEAD` of buckets marked **public** in the admin panel. Ideal for a CDN/asset domain. | None (read-only). |
 
 Anonymous public-bucket reads are served **only** on the public port; the API port
 always requires a valid signature.
 
 ## Configuration
 
-All settings are available as CLI flags and environment variables.
+Startup settings — the bind address, ports, credentials, and whether the admin
+panel is enabled — are CLI flags / environment variables. Everything else (public
+buckets, domains, custom-domain mappings, the public API URL and the admin session
+lifetime) is managed in the admin panel and persisted in a SQLite database; see
+[Runtime settings](#runtime-settings).
 
 | Env var             | Flag              | Default   | Description |
 |---------------------|-------------------|-----------|-------------|
@@ -80,27 +84,39 @@ All settings are available as CLI flags and environment variables.
 | `S3_PUBLIC_PORT`    | `--public-port`   | `8082`    | Public read-only port (anonymous reads of public buckets). |
 | `S3_ACCESS_KEY`     | `--access-key`    | —         | SigV4 access key (set with the secret). |
 | `S3_SECRET_KEY`     | `--secret-key`    | —         | SigV4 secret key (set with the access key). |
-| `S3_PUBLIC_BUCKETS` | `--public-bucket` | —         | Comma-separated buckets that allow anonymous reads (served on the public port). |
-| `S3_DOMAINS`        | `--domain`        | —         | Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. |
-| `S3_DOMAIN_MAP`     | `--domain-map`    | —         | Comma-separated `host=bucket` custom-domain mappings. |
 | `S3_ADMIN_ENABLED`  | `--admin-enabled` | `false`   | Enable the embedded web admin panel (requires credentials). |
-| `S3_ADMIN_SESSION_TTL` | `--admin-session-ttl` | `3600` | Admin session lifetime, in seconds. |
-| `S3_API_PUBLIC_URL` | `--api-public-url` | —        | Public base URL of the API (e.g. `https://api.example.com`), used by the admin panel for presigned links. |
 
 Notes:
 - If `S3_ACCESS_KEY`/`S3_SECRET_KEY` are **unset**, the API port runs fully open and
   unauthenticated (handy for local development only).
-- **Access mode is per-bucket and configuration-driven.** A bucket is private by
-  default; list it in `S3_PUBLIC_BUCKETS` to allow anonymous `GET`/`HEAD` on the
-  public port. Writes always require a valid signature (API port).
-- **Custom domains** map a `Host` header to a bucket via `S3_DOMAIN_MAP`. Point the
-  domain's DNS/your reverse proxy at the public port and preserve the original
-  `Host` header.
+- **Access mode is per-bucket.** A bucket is private by default; mark it public in
+  the admin panel (Buckets page, or the Settings page) to allow anonymous
+  `GET`/`HEAD` on the public port. Writes always require a valid signature (API port).
+- **Custom domains** map a `Host` header to a bucket via the panel's domain map.
+  Point the domain's DNS/your reverse proxy at the public port and preserve the
+  original `Host` header.
 - **Presigned links** are SigV4-signed over their host, so the admin panel must mint
-  them against the host SDK clients actually reach. Set `S3_API_PUBLIC_URL` to the
-  API's public URL. It is **required** to generate presigned links: when unset the
+  them against the host SDK clients actually reach. Set the **public API URL** in the
+  panel settings. It is **required** to generate presigned links: when unset the
   panel returns a clear error rather than emitting a link that points at the admin
   port (which does not serve S3).
+
+### Runtime settings
+
+These deployment-facing settings live in a SQLite database at
+`{root}/.s3-storage/settings.db` and are edited entirely through the admin panel
+(no restart needed — changes take effect live):
+
+- **Public buckets** — which buckets allow anonymous `GET`/`HEAD` on the public port.
+- **Domains** — base domains for `<bucket>.<domain>` virtual-hosting.
+- **Custom domain map** — `host=bucket` mappings that point a host straight at a bucket.
+- **Public API URL** — the API's public base URL used to mint presigned links.
+- **Admin session lifetime** — how long a login stays valid (applies to new logins).
+
+The database is created automatically on first start with empty defaults. Because
+it lives under the data root, it travels with your storage volume and is included in
+backups. Bind address, ports and credentials are deliberately **not** stored here —
+they bootstrap the panel itself and stay on the CLI/env.
 
 ## Admin panel
 
@@ -115,7 +131,7 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
 ```
 
 - **Login** uses your S3 access key + secret key; a signed, `HttpOnly` session
-  cookie (lifetime `S3_ADMIN_SESSION_TTL`) keeps you signed in. The cookie is
+  cookie (lifetime set in the panel's Settings page) keeps you signed in. The cookie is
   marked `Secure` only when the request arrives over HTTPS (detected via
   `X-Forwarded-Proto`, set by a TLS-terminating reverse proxy, or the request
   scheme), so it works over plain HTTP too — though serving the panel over
@@ -123,15 +139,17 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   clear. No SigV4 signing
   happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the
   admin port) that reuses the storage backend directly, so no CORS setup is needed.
-- **Covers every server feature**: dashboard stats, bucket create/delete with
-  public/private status, an object browser (folder navigation, drag-and-drop
+- **Covers every server feature**: dashboard stats, bucket create/delete with a
+  live public/private toggle, a Settings page for domains / custom-domain map /
+  public API URL / session lifetime, an object browser (folder navigation, drag-and-drop
   upload, download, byte-range, copy/move/rename, batch delete, folders, metadata
   editor, checksums, presigned GET/PUT share links), and multipart session
   management (list parts, abort).
 - **Dedicated port, no path shadowing.** The panel owns its own port, so it never
   collides with bucket names and you can front it with its own domain. Presigned
-  links it generates target the API port — set `S3_API_PUBLIC_URL` so they point at
-  the host clients actually reach (see [Configuration](#configuration)).
+  links it generates target the API port — set the **public API URL** in the panel
+  settings so they point at the host clients actually reach (see
+  [Runtime settings](#runtime-settings)).
 - If credentials are not configured the panel stays disabled (a warning is logged)
   and the API port continues to serve open/unauthenticated.
 
@@ -154,8 +172,7 @@ services:
     environment:
       S3_ACCESS_KEY: s3storage
       S3_SECRET_KEY: s3storage-secret
-      S3_PUBLIC_BUCKETS: assets            # anonymous reads on "assets" (public port)
-      S3_DOMAIN_MAP: files.example.com=assets
+      S3_ADMIN_ENABLED: "true"             # then set public buckets / domains in the panel
       RUST_LOG: info
     volumes:
       - s3data:/data                       # or:  - ./data:/data
@@ -171,9 +188,10 @@ volumes:
 docker build -t s3-storage .
 docker run -d --name s3-storage -p 8080:8080 -p 8081:8081 -p 8082:8082 \
   -e S3_ACCESS_KEY=s3storage -e S3_SECRET_KEY=s3storage-secret \
-  -e S3_PUBLIC_BUCKETS=assets \
+  -e S3_ADMIN_ENABLED=true \
   -v s3data:/data \
   s3-storage
+# then open http://localhost:8081/ and mark buckets public / add domains in the panel
 ```
 
 ## Client examples
@@ -225,8 +243,8 @@ curl http://files.example.com/logo.png
 
 ```bash
 cargo run -- --root ./data --port 8080            # open mode (no auth)
-cargo run -- --root ./data --access-key key --secret-key secret \
-             --public-bucket assets --domain-map files.example.com=assets
+cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
+# then open http://localhost:8081/ to mark buckets public and add domain mappings
 ```
 
 ## Tests
@@ -256,7 +274,7 @@ it to untrusted networks:
 - **Use strong, rotated credentials** via `S3_ACCESS_KEY`/`S3_SECRET_KEY`. Never
   run with auth disabled (no credentials) on a public network.
 - **Keep public buckets read-only by intent** — anonymous access is limited to
-  `GET`/`HEAD` on buckets you explicitly list in `S3_PUBLIC_BUCKETS`; writes always
+  `GET`/`HEAD` on buckets you explicitly mark public in the admin panel; writes always
   require a valid signature.
 
 Report vulnerabilities privately via the repository's security contact rather than

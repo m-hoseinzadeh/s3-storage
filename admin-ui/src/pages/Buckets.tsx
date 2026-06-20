@@ -12,6 +12,7 @@ export function Buckets() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [toDelete, setToDelete] = useState<string | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
   const toast = useToast();
 
   const load = useCallback(() => {
@@ -35,6 +36,24 @@ export function Buckets() {
       toast("error", e instanceof ApiError ? e.message : "Create failed");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const togglePublic = async (b: BucketInfo) => {
+    setToggling(b.name);
+    try {
+      // Re-read the current set so concurrent edits aren't clobbered.
+      const cfg = await api.config();
+      const set = new Set(cfg.public_buckets);
+      if (b.public) set.delete(b.name);
+      else set.add(b.name);
+      await api.updateSettings({ public_buckets: [...set] });
+      toast("success", `“${b.name}” is now ${b.public ? "private" : "public"}`);
+      load();
+    } catch (e) {
+      toast("error", e instanceof ApiError ? e.message : "Failed to update visibility");
+    } finally {
+      setToggling(null);
     }
   };
 
@@ -62,7 +81,7 @@ export function Buckets() {
           <TutList
             items={[
               "Click New bucket and enter a DNS-style name (lowercase letters, numbers, hyphens).",
-              "A public badge means the bucket is listed in S3_PUBLIC_BUCKETS and allows anonymous GET/HEAD.",
+              "Click the public/private badge on a bucket to toggle anonymous GET/HEAD access.",
               "Open a bucket to manage its objects in the Object Browser.",
               "Deleting a bucket removes it and all objects inside — this cannot be undone.",
             ]}
@@ -98,15 +117,24 @@ export function Buckets() {
                 <div className="grid h-10 w-10 place-items-center rounded-lg bg-[var(--color-surface-2)] text-[var(--color-accent)]">
                   <Database className="h-5 w-5" />
                 </div>
-                {b.public ? (
-                  <Badge tone="accent">
-                    <Globe className="h-3 w-3" /> public
-                  </Badge>
-                ) : (
-                  <Badge tone="muted">
-                    <Lock className="h-3 w-3" /> private
-                  </Badge>
-                )}
+                <button
+                  type="button"
+                  onClick={() => togglePublic(b)}
+                  disabled={toggling === b.name}
+                  aria-label={`Make ${b.name} ${b.public ? "private" : "public"}`}
+                  title={`Click to make ${b.public ? "private" : "public"}`}
+                  className="focusable cursor-pointer rounded-full disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {b.public ? (
+                    <Badge tone="accent">
+                      <Globe className="h-3 w-3" /> public
+                    </Badge>
+                  ) : (
+                    <Badge tone="muted">
+                      <Lock className="h-3 w-3" /> private
+                    </Badge>
+                  )}
+                </button>
               </div>
               <div className="mt-3 truncate font-semibold" title={b.name}>
                 {b.name}

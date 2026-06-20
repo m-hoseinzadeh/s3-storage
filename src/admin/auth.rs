@@ -10,24 +10,33 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+use crate::settings::SharedSettings;
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Name of the session cookie.
 pub const COOKIE_NAME: &str = "s3admin_session";
 
-/// Immutable session configuration shared by the admin route.
+/// Session configuration shared by the admin route. The lifetime (`ttl_secs`) is
+/// read live from the settings store, so changing it in the panel affects sessions
+/// issued thereafter without a restart.
 #[derive(Debug, Clone)]
 pub struct Sessions {
     access_key: String,
     secret_key: String,
-    ttl_secs: u64,
+    settings: SharedSettings,
     cookie_path: String,
 }
 
 impl Sessions {
     #[must_use]
-    pub fn new(access_key: String, secret_key: String, ttl_secs: u64, cookie_path: String) -> Self {
-        Self { access_key, secret_key, ttl_secs, cookie_path }
+    pub fn new(access_key: String, secret_key: String, settings: SharedSettings, cookie_path: String) -> Self {
+        Self { access_key, secret_key, settings, cookie_path }
+    }
+
+    /// Current session lifetime in seconds (from the settings store).
+    fn ttl_secs(&self) -> u64 {
+        self.settings.session_ttl_secs()
     }
 
     /// Constant-time check of submitted credentials against the configured pair.
@@ -55,7 +64,7 @@ impl Sessions {
     /// Issue a signed token valid for `ttl_secs` from now.
     #[must_use]
     pub fn issue(&self) -> String {
-        let exp = now_unix().saturating_add(i64::try_from(self.ttl_secs).unwrap_or(i64::MAX));
+        let exp = now_unix().saturating_add(i64::try_from(self.ttl_secs()).unwrap_or(i64::MAX));
         let payload = serde_json::json!({ "sub": self.access_key, "exp": exp });
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         let payload_b64 = Self::b64(&payload_bytes);
@@ -98,7 +107,8 @@ impl Sessions {
         let secure_attr = if secure { "; Secure" } else { "" };
         format!(
             "{COOKIE_NAME}={token}; HttpOnly{secure_attr}; SameSite=Strict; Path={}; Max-Age={}",
-            self.cookie_path, self.ttl_secs
+            self.cookie_path,
+            self.ttl_secs()
         )
     }
 

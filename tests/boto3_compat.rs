@@ -8,7 +8,7 @@ use std::process::Command;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use s3_storage::{Config, build_api_service, open_backend, serve};
+use s3_storage::{Config, SettingsStore, build_api_service, open_backend, serve};
 
 const ACCESS_KEY: &str = "boto3-access";
 const SECRET_KEY: &str = "boto3-secret";
@@ -39,22 +39,18 @@ async fn boto3_sdk_compatibility() {
     std::fs::create_dir_all(&root).unwrap();
 
     let config = Config {
-        root,
+        root: root.clone(),
         host: "127.0.0.1".to_owned(),
         port: 0,
         public_port: 0,
         access_key: Some(ACCESS_KEY.to_owned()),
         secret_key: Some(SECRET_KEY.to_owned()),
-        domains: vec![],
-        public_buckets: vec![],
-        domain_map: vec![],
         admin_enabled: false,
         admin_port: 0,
-        admin_session_ttl_secs: 3600,
-        api_public_url: None,
     };
 
-    let service = build_api_service(&config, open_backend(&config).unwrap());
+    let settings = SettingsStore::open(&root).unwrap();
+    let service = build_api_service(&config, open_backend(&config).unwrap(), &settings);
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();

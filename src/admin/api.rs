@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use super::auth::token_from_cookies;
 use super::{ApiError, AdminState, finish, json_ok, presign};
 use crate::backend::ObjectAttributes;
+use crate::settings::SettingsUpdate;
 
 const JSON_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -47,6 +48,7 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
             "authenticated": true, "access_key": state.access_key,
         }))),
         (&Method::GET, ["config"]) => Ok(config(state)),
+        (&Method::PUT, ["settings"]) => update_settings(state, body).await,
         (&Method::GET, ["stats"]) => stats(state).await,
 
         (&Method::GET, ["buckets"]) => list_buckets(state).await,
@@ -129,14 +131,30 @@ fn is_authenticated(state: &AdminState, headers: &HeaderMap) -> bool {
 // ---- config & stats ----
 
 fn config(state: &AdminState) -> S3Response<Body> {
+    let s = state.settings.snapshot();
     json_ok(serde_json::json!({
         "access_key": state.access_key,
-        "public_buckets": state.public_buckets,
-        "domains": state.domains,
-        "domain_map": state.domain_map,
+        "public_buckets": s.public_buckets,
+        "domains": s.domains,
+        "domain_map": s.domain_map,
+        "api_public_url": s.api_public_url,
+        "admin_session_ttl_secs": s.admin_session_ttl_secs,
         "admin_path": "/",
         "version": state.version,
     }))
+}
+
+async fn update_settings(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let upd: SettingsUpdate = read_json(body).await?;
+    upd.validate().map_err(ApiError::bad_request)?;
+    // rusqlite is blocking; run the transaction off the async runtime. The store is
+    // an `Arc`, so cloning the handle into the blocking task is cheap.
+    let settings = std::sync::Arc::clone(&state.settings);
+    tokio::task::spawn_blocking(move || settings.update(&upd))
+        .await
+        .map_err(|e| ApiError::internal(format!("settings update task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("failed to persist settings: {e}")))?;
+    Ok(json_ok(serde_json::json!({ "ok": true })))
 }
 
 async fn stats(state: &AdminState) -> Result<S3Response<Body>, ApiError> {
@@ -165,7 +183,7 @@ async fn stats(state: &AdminState) -> Result<S3Response<Body>, ApiError> {
         "bucket_count": bucket_stats.len(),
         "object_count": total_objects,
         "total_size": total_size,
-        "public_bucket_count": state.public_buckets.len(),
+        "public_bucket_count": state.settings.snapshot().public_buckets.len(),
         "buckets": bucket_stats,
     })))
 }
@@ -468,15 +486,15 @@ fn presign_object(state: &AdminState, q: &Query) -> Result<S3Response<Body>, Api
     // different port/domain than the S3 API. So the target host must come from the
     // operator-configured public API URL, never from the (client-controlled, and
     // here always wrong) request Host header.
-    let base = state.api_public_url.as_deref().ok_or_else(|| {
+    let base = state.settings.api_public_url().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "NotConfigured",
-            "presigned URLs require the server to be started with S3_API_PUBLIC_URL set to the \
-             public base URL of the S3 API (e.g. https://api.example.com)",
+            "presigned URLs require the public API URL to be set in the admin panel settings \
+             (the public base URL of the S3 API, e.g. https://api.example.com)",
         )
     })?;
-    let (scheme, host) = split_scheme_host(base);
+    let (scheme, host) = split_scheme_host(&base);
     if host.is_empty() {
         return Err(ApiError::internal("S3_API_PUBLIC_URL is malformed (no host)"));
     }

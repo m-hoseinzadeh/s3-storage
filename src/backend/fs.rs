@@ -114,6 +114,13 @@ impl FileSystem {
         Ok(Self { root, tmp_file_counter })
     }
 
+    /// The canonicalized data root. Used to locate sidecar state (e.g. the
+    /// settings DB) alongside the object data.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn resolve_abs_path(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
         Ok(path.as_ref().absolutize_virtually(&self.root)?.into_owned())
     }

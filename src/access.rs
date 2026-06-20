@@ -14,6 +14,14 @@ use s3s::S3Result;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::s3_error;
 
+use crate::settings::SharedSettings;
+
+/// Access policy for the authenticated S3 API port. The `public_buckets` set is
+/// always empty here (installed via `AccessControl::new(HashSet::new())`): the API
+/// port authenticates every request and never serves anonymous reads — those are
+/// served on the dedicated public port by [`PublicReadAccess`]. It is intentionally
+/// *not* settings-backed, so the API port's security posture cannot change at
+/// runtime.
 #[derive(Debug)]
 pub struct AccessControl {
     public_buckets: HashSet<String>,
@@ -59,13 +67,13 @@ impl S3Access for AccessControl {
 /// public service still installs an auth provider purely to enable this stage.
 #[derive(Debug)]
 pub struct PublicReadAccess {
-    public_buckets: HashSet<String>,
+    settings: SharedSettings,
 }
 
 impl PublicReadAccess {
     #[must_use]
-    pub fn new(public_buckets: HashSet<String>) -> Self {
-        Self { public_buckets }
+    pub fn new(settings: SharedSettings) -> Self {
+        Self { settings }
     }
 }
 
@@ -79,7 +87,7 @@ impl S3Access for PublicReadAccess {
         if is_read
             && cx.s3_path().get_object_key().is_some()
             && let Some(bucket) = cx.s3_path().get_bucket_name()
-            && self.public_buckets.contains(bucket)
+            && self.settings.is_public(bucket)
         {
             return Ok(());
         }

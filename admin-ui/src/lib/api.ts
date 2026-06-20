@@ -49,8 +49,20 @@ export interface ServerConfig {
   public_buckets: string[];
   domains: string[];
   domain_map: string[];
+  api_public_url?: string | null;
+  admin_session_ttl_secs?: number;
   admin_path: string;
   version: string;
+}
+
+// Partial update; omitted fields are left unchanged. A blank `api_public_url`
+// clears the stored value.
+export interface SettingsUpdate {
+  public_buckets?: string[];
+  domains?: string[];
+  domain_map?: string[];
+  api_public_url?: string;
+  admin_session_ttl_secs?: number;
 }
 
 export interface Stats {
@@ -121,6 +133,12 @@ export const api = {
 
   // server
   config: () => call<ServerConfig>("/config"),
+  updateSettings: (data: SettingsUpdate) =>
+    call<{ ok: boolean }>("/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }),
   stats: () => call<Stats>("/stats"),
 
   // buckets

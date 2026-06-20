@@ -26,22 +26,21 @@ use s3s::{Body, S3Request, S3Response, S3Result};
 
 use crate::backend::FileSystem;
 use crate::config::Config;
+use crate::settings::SharedSettings;
 
 use self::auth::Sessions;
 
-/// Shared, immutable state for the admin panel.
+/// Shared state for the admin panel. The deployment-facing settings live in
+/// [`settings`](crate::settings) and are read live; only credentials and the
+/// version are fixed at construction.
 pub struct AdminState {
     pub(crate) fs: Arc<FileSystem>,
     pub(crate) sessions: Sessions,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
-    pub(crate) public_buckets: Vec<String>,
-    pub(crate) domains: Vec<String>,
-    pub(crate) domain_map: Vec<String>,
-    /// Public base URL of the S3 API used for presigned links; see
-    /// [`crate::Config::api_public_url`]. Normalized so a blank value is `None`,
-    /// in which case presigning is refused (the panel cannot infer the API host).
-    pub(crate) api_public_url: Option<String>,
+    /// Runtime-editable settings (public buckets, domains, domain map, API URL,
+    /// session TTL), persisted in SQLite and managed via the panel.
+    pub(crate) settings: SharedSettings,
     pub(crate) version: &'static str,
 }
 
@@ -49,13 +48,14 @@ impl AdminState {
     /// Build admin state. Requires credentials to be configured (callers gate on
     /// [`Config::admin_active`]).
     #[must_use]
-    pub fn new(fs: Arc<FileSystem>, config: &Config) -> Self {
+    pub fn new(fs: Arc<FileSystem>, config: &Config, settings: SharedSettings) -> Self {
         let (access_key, secret_key) = config.credentials().expect("admin requires credentials");
         // The panel owns the whole port, so the session cookie is scoped to root.
+        // The TTL is read live from the settings store on each issued session.
         let sessions = Sessions::new(
             access_key.clone(),
             secret_key.clone(),
-            config.admin_session_ttl_secs,
+            Arc::clone(&settings),
             "/".to_owned(),
         );
         Self {
@@ -63,17 +63,7 @@ impl AdminState {
             sessions,
             access_key,
             secret_key,
-            public_buckets: config.public_buckets.clone(),
-            domains: config.domains.clone(),
-            domain_map: config.domain_map.clone(),
-            // Treat a blank value (e.g. an empty `S3_API_PUBLIC_URL` env var, which
-            // clap surfaces as `Some("")`) as unset.
-            api_public_url: config
-                .api_public_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned),
+            settings,
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -98,7 +88,7 @@ impl AdminState {
     }
 
     pub(crate) fn is_public(&self, bucket: &str) -> bool {
-        self.public_buckets.iter().any(|b| b == bucket)
+        self.settings.is_public(bucket)
     }
 }
 

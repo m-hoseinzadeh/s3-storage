@@ -3,13 +3,16 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use s3_storage::{Config, build_admin_service, build_api_service, open_backend, serve};
+use s3_storage::{
+    Config, SettingsStore, SettingsUpdate, SharedSettings, build_admin_service, build_api_service,
+    build_public_service, open_backend, serve,
+};
 use s3s::service::S3Service;
 
 struct TestServer {
@@ -26,6 +29,17 @@ struct AdminWithApi {
     _api_shutdown: oneshot::Sender<()>,
 }
 
+/// An admin service paired with a public read-only service sharing one settings
+/// store, to verify that toggling a bucket public via the admin API serves it on
+/// the public port live (no restart).
+struct AdminWithPublic {
+    admin: SocketAddr,
+    public: SocketAddr,
+    root: PathBuf,
+    _admin_shutdown: oneshot::Sender<()>,
+    _public_shutdown: oneshot::Sender<()>,
+}
+
 fn unique_dir() -> PathBuf {
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -36,7 +50,7 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn admin_config(root: PathBuf, api_public_url: Option<String>) -> Config {
+fn admin_config(root: PathBuf) -> Config {
     Config {
         root,
         host: "127.0.0.1".to_owned(),
@@ -44,14 +58,19 @@ fn admin_config(root: PathBuf, api_public_url: Option<String>) -> Config {
         public_port: 0,
         access_key: Some("admin-key".to_owned()),
         secret_key: Some("admin-secret".to_owned()),
-        domains: vec![],
-        public_buckets: vec!["assets".to_owned()],
-        domain_map: vec![],
         admin_enabled: true,
         admin_port: 0,
-        admin_session_ttl_secs: 3600,
-        api_public_url,
     }
+}
+
+/// Open a settings store under `root` and seed the runtime-editable values that
+/// used to come from CLI flags.
+fn seed_settings(root: &Path, public_buckets: Vec<String>, api_public_url: Option<String>) -> SharedSettings {
+    let settings = SettingsStore::open(root).unwrap();
+    settings
+        .update(&SettingsUpdate { public_buckets: Some(public_buckets), api_public_url, ..Default::default() })
+        .unwrap();
+    settings
 }
 
 /// Bind a listener and serve `service`, returning its live address + shutdown.
@@ -69,27 +88,64 @@ async fn serve_service(service: S3Service) -> (SocketAddr, oneshot::Sender<()>) 
 }
 
 async fn spawn() -> TestServer {
-    let config = admin_config(unique_dir(), None);
-    let service = build_admin_service(&config, open_backend(&config).unwrap());
+    let root = unique_dir();
+    let config = admin_config(root.clone());
+    // The built service holds its own `Arc` clone of the store, so the local handle
+    // can drop; "assets" is seeded public for the lifecycle assertions.
+    let settings = seed_settings(&root, vec!["assets".to_owned()], None);
+    let service = build_admin_service(&config, open_backend(&config).unwrap(), &settings);
     let (addr, tx) = serve_service(service).await;
     TestServer { addr, _shutdown: tx }
 }
 
 /// Spawn an API service first (to learn its address), then an admin service over
-/// the same data root with `api_public_url` pointed at the API, so presigned links
-/// the panel mints can be verified against the API port.
+/// the same data root + shared settings, with `api_public_url` pointed at the API,
+/// so presigned links the panel mints can be verified against the API port.
 async fn spawn_with_api() -> AdminWithApi {
     let root = unique_dir();
+    let config = admin_config(root.clone());
+    let settings = seed_settings(&root, vec!["assets".to_owned()], None);
 
-    let api_config = admin_config(root.clone(), None);
-    let api_service = build_api_service(&api_config, open_backend(&api_config).unwrap());
+    let api_service = build_api_service(&config, open_backend(&config).unwrap(), &settings);
     let (api, api_shutdown) = serve_service(api_service).await;
 
-    let admin_config = admin_config(root, Some(format!("http://{api}")));
-    let admin_service = build_admin_service(&admin_config, open_backend(&admin_config).unwrap());
+    // Point presigning at the now-known API address (a live settings edit).
+    settings
+        .update(&SettingsUpdate { api_public_url: Some(format!("http://{api}")), ..Default::default() })
+        .unwrap();
+
+    let admin_service = build_admin_service(&config, open_backend(&config).unwrap(), &settings);
     let (admin, admin_shutdown) = serve_service(admin_service).await;
 
     AdminWithApi { admin, api, _admin_shutdown: admin_shutdown, _api_shutdown: api_shutdown }
+}
+
+/// Spawn an admin service and a public read-only service sharing one settings store.
+async fn spawn_with_public() -> AdminWithPublic {
+    let root = unique_dir();
+    let config = admin_config(root.clone());
+    // Nothing public to start with.
+    let settings = seed_settings(&root, vec![], None);
+
+    let public_service = build_public_service(&config, open_backend(&config).unwrap(), &settings);
+    let (public, public_shutdown) = serve_service(public_service).await;
+
+    let admin_service = build_admin_service(&config, open_backend(&config).unwrap(), &settings);
+    let (admin, admin_shutdown) = serve_service(admin_service).await;
+
+    AdminWithPublic { admin, public, root, _admin_shutdown: admin_shutdown, _public_shutdown: public_shutdown }
+}
+
+/// Log in with the test credentials and return the session cookie.
+fn login(addr: SocketAddr) -> String {
+    let resp = request(
+        addr,
+        "POST",
+        "/api/login",
+        &[JSON],
+        Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
+    );
+    resp.cookie().expect("login must set a session cookie")
 }
 
 struct Resp {
@@ -364,4 +420,92 @@ async fn admin_presign_round_trip() {
     // Without the signature, the same private object is forbidden on the API port.
     let unsigned = request(api, "GET", "/docs/secret.txt", &[], None);
     assert_eq!(unsigned.status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_settings_persist_and_reflect() {
+    let root = unique_dir();
+    {
+        let config = admin_config(root.clone());
+        // First run: no seeding, so the store starts at empty defaults.
+        let settings = SettingsStore::open(&root).unwrap();
+        let service = build_admin_service(&config, open_backend(&config).unwrap(), &settings);
+        let (addr, _tx) = serve_service(service).await;
+        let cookie = login(addr);
+        let auth = [("Cookie", cookie.as_str())];
+        let auth_json = [("Cookie", cookie.as_str()), JSON];
+
+        // Fresh defaults are empty and the DB now exists on disk.
+        let cfg = request(addr, "GET", "/api/config", &auth, None);
+        assert_eq!(cfg.status, 200);
+        assert!(cfg.text().contains("\"public_buckets\":[]"), "fresh config: {}", cfg.text());
+        assert!(root.join(".s3-storage/settings.db").is_file(), "settings.db must be created");
+
+        // Edit every field via PUT.
+        let put = request(
+            addr,
+            "PUT",
+            "/api/settings",
+            &auth_json,
+            Some(
+                br#"{"public_buckets":["assets"],"domains":["cdn.example.com"],"domain_map":["files.example.com=assets"],"api_public_url":"https://api.example.com","admin_session_ttl_secs":1800}"#,
+            ),
+        );
+        assert_eq!(put.status, 200);
+
+        let t = request(addr, "GET", "/api/config", &auth, None).text();
+        assert!(t.contains("\"public_buckets\":[\"assets\"]"), "{t}");
+        assert!(t.contains("\"domains\":[\"cdn.example.com\"]"), "{t}");
+        assert!(t.contains("files.example.com=assets"), "{t}");
+        assert!(t.contains("\"api_public_url\":\"https://api.example.com\""), "{t}");
+        assert!(t.contains("\"admin_session_ttl_secs\":1800"), "{t}");
+    }
+
+    // "Restart": a fresh store over the same root reads the persisted values.
+    let reopened = SettingsStore::open(&root).unwrap();
+    let snap = reopened.snapshot();
+    assert_eq!(snap.public_buckets, vec!["assets".to_owned()]);
+    assert_eq!(snap.domains, vec!["cdn.example.com".to_owned()]);
+    assert_eq!(snap.domain_map, vec!["files.example.com=assets".to_owned()]);
+    assert_eq!(snap.api_public_url.as_deref(), Some("https://api.example.com"));
+    assert_eq!(snap.admin_session_ttl_secs, 1800);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_settings_validation() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let auth_json = [("Cookie", cookie.as_str()), JSON];
+
+    // Malformed domain map entry.
+    let bad = request(a, "PUT", "/api/settings", &auth_json, Some(br#"{"domain_map":["no-equals"]}"#));
+    assert_eq!(bad.status, 400);
+    // Zero TTL.
+    let bad2 = request(a, "PUT", "/api/settings", &auth_json, Some(br#"{"admin_session_ttl_secs":0}"#));
+    assert_eq!(bad2.status, 400);
+    // Unauthenticated edits are rejected.
+    let unauth = request(a, "PUT", "/api/settings", &[JSON], Some(br#"{"domains":[]}"#));
+    assert_eq!(unauth.status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_public_toggle_serves_on_public_port() {
+    let srv = spawn_with_public().await;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
+
+    // Initially private: the public port denies the anonymous read.
+    assert_eq!(request(srv.public, "GET", "/assets/logo.txt", &[], None).status, 403);
+
+    // Toggle the bucket public through the admin API.
+    let cookie = login(srv.admin);
+    let auth_json = [("Cookie", cookie.as_str()), JSON];
+    let put = request(srv.admin, "PUT", "/api/settings", &auth_json, Some(br#"{"public_buckets":["assets"]}"#));
+    assert_eq!(put.status, 200);
+
+    // Now served anonymously on the public port — no restart.
+    let r = request(srv.public, "GET", "/assets/logo.txt", &[], None);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, b"PUBLIC");
 }

@@ -45,6 +45,11 @@ sha2 = "=0.11.0-rc.5"
 subtle = "2.6"
 time = { version = "0.3", features = ["formatting"] }
 
+# Persisted, runtime-editable settings store. `bundled` compiles SQLite from
+# source (no system libsqlite3 needed); the DB is touched only at startup and on
+# rare admin edits, never on the per-request hot path.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
 # Server + config + logging
 clap = { version = "4", features = ["derive", "env"] }
 hyper = { version = "1", features = ["http1", "http2"] }

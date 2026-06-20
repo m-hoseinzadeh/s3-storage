@@ -8,18 +8,21 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use s3_storage::{Config, build_api_service, build_public_service, open_backend, serve};
+use s3_storage::{
+    Config, SettingsStore, SettingsUpdate, SharedSettings, build_api_service, build_public_service, open_backend, serve,
+};
 use s3s::service::S3Service;
 
 struct TestServer {
     addr: SocketAddr,
     root: PathBuf,
+    settings: SharedSettings,
     _shutdown: oneshot::Sender<()>,
 }
 
@@ -33,7 +36,7 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-fn test_config(root: PathBuf, auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>) -> Config {
+fn test_config(root: PathBuf, auth: bool) -> Config {
     let (access_key, secret_key) = if auth {
         (Some("it-access".to_owned()), Some("it-secret".to_owned()))
     } else {
@@ -46,18 +49,27 @@ fn test_config(root: PathBuf, auth: bool, public_buckets: Vec<String>, domain_ma
         public_port: 0,
         access_key,
         secret_key,
-        domains: vec![],
-        public_buckets,
-        domain_map,
         admin_enabled: false,
         admin_port: 0,
-        admin_session_ttl_secs: 3600,
-        api_public_url: None,
     }
 }
 
+/// Open a settings store under `root` and seed the runtime-editable values that
+/// used to come from CLI flags.
+fn seed_settings(root: &Path, public_buckets: Vec<String>, domain_map: Vec<String>) -> SharedSettings {
+    let settings = SettingsStore::open(root).unwrap();
+    settings
+        .update(&SettingsUpdate {
+            public_buckets: Some(public_buckets),
+            domain_map: Some(domain_map),
+            ..Default::default()
+        })
+        .unwrap();
+    settings
+}
+
 /// Bind a listener and serve `service` on it, returning the live address.
-async fn serve_on(root: PathBuf, service: S3Service) -> TestServer {
+async fn serve_on(root: PathBuf, settings: SharedSettings, service: S3Service) -> TestServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -67,16 +79,17 @@ async fn serve_on(root: PathBuf, service: S3Service) -> TestServer {
         })
         .await;
     });
-    TestServer { addr, root, _shutdown: tx }
+    TestServer { addr, root, settings, _shutdown: tx }
 }
 
 /// Spawn the authenticated **API** service (anonymous access rejected unless `auth`
 /// is false, in which case it runs fully open for the CRUD tests).
 async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>) -> TestServer {
     let root = unique_dir();
-    let config = test_config(root.clone(), auth, public_buckets, domain_map);
-    let service = build_api_service(&config, open_backend(&config).unwrap());
-    serve_on(root, service).await
+    let config = test_config(root.clone(), auth);
+    let settings = seed_settings(&root, public_buckets, domain_map);
+    let service = build_api_service(&config, open_backend(&config).unwrap(), &settings);
+    serve_on(root, settings, service).await
 }
 
 /// Spawn the **public** read-only service. Credentials are configured (so `s3s`
@@ -84,9 +97,10 @@ async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>)
 /// public buckets is permitted.
 async fn spawn_public(public_buckets: Vec<String>, domain_map: Vec<String>) -> TestServer {
     let root = unique_dir();
-    let config = test_config(root.clone(), true, public_buckets, domain_map);
-    let service = build_public_service(&config, open_backend(&config).unwrap());
-    serve_on(root, service).await
+    let config = test_config(root.clone(), true);
+    let settings = seed_settings(&root, public_buckets, domain_map);
+    let service = build_public_service(&config, open_backend(&config).unwrap(), &settings);
+    serve_on(root, settings, service).await
 }
 
 struct Resp {
@@ -308,6 +322,52 @@ async fn api_port_rejects_anonymous_even_for_public_buckets() {
     std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
 
     assert_eq!(get(a, "/assets/logo.txt").status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_bucket_toggle_takes_effect_live() {
+    // No public buckets initially.
+    let srv = spawn_public(vec![], vec![]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
+
+    // Private -> anonymous read denied.
+    assert_eq!(get(a, "/assets/logo.txt").status, 403);
+
+    // Mark it public live (what `PUT /api/settings` does), no restart.
+    srv.settings
+        .update(&SettingsUpdate { public_buckets: Some(vec!["assets".to_owned()]), ..Default::default() })
+        .unwrap();
+    let now = get(a, "/assets/logo.txt");
+    assert_eq!(now.status, 200, "public toggle must take effect without a restart");
+    assert_eq!(now.body, b"PUBLIC");
+
+    // And back to private, live.
+    srv.settings
+        .update(&SettingsUpdate { public_buckets: Some(vec![]), ..Default::default() })
+        .unwrap();
+    assert_eq!(get(a, "/assets/logo.txt").status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_map_change_takes_effect_live() {
+    let srv = spawn_public(vec!["assets".to_owned()], vec![]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/index.html"), b"<html>").unwrap();
+
+    // Without a mapping the custom host falls back to path-style, so `/index.html`
+    // addresses no object in a public bucket -> denied.
+    assert_eq!(request(a, "GET", "files.example.com", "/index.html", None).status, 403);
+
+    // Add the mapping live.
+    srv.settings
+        .update(&SettingsUpdate { domain_map: Some(vec!["files.example.com=assets".to_owned()]), ..Default::default() })
+        .unwrap();
+    let resp = request(a, "GET", "files.example.com", "/index.html", None);
+    assert_eq!(resp.status, 200, "domain map edit must route live");
+    assert_eq!(resp.body, b"<html>");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

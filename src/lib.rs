@@ -10,6 +10,7 @@ mod admin;
 mod backend;
 mod config;
 mod host;
+mod settings;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -33,6 +34,7 @@ pub use crate::access::{AccessControl, PublicReadAccess};
 pub use crate::backend::FileSystem;
 pub use crate::config::Config;
 pub use crate::host::CustomHost;
+pub use crate::settings::{RuntimeSettings, SettingsStore, SettingsUpdate, SharedSettings};
 
 /// Open the on-disk storage backend. A single instance is shared by all three
 /// services so they share its atomic temp-file counter and never collide on writes.
@@ -43,18 +45,19 @@ pub fn open_backend(config: &Config) -> io::Result<Arc<FileSystem>> {
 }
 
 /// Host routing, installed on every S3-serving service so path-style works and
-/// custom domains / base-domain virtual-hosting resolve when configured.
-fn host_router(config: &Config) -> CustomHost {
-    CustomHost::new(config.domains.clone(), config.parsed_domain_map())
+/// custom domains / base-domain virtual-hosting resolve when configured. Reads the
+/// domain configuration live from the settings store.
+fn host_router(settings: &SharedSettings) -> CustomHost {
+    CustomHost::new(Arc::clone(settings))
 }
 
 /// Build the **authenticated S3 API** service (SDK clients). Anonymous access is
 /// rejected: access control is installed with an empty public-bucket set, so only
 /// SigV4-authenticated requests pass. With no credentials configured the service is
 /// left fully open (local-development behaviour).
-pub fn build_api_service(config: &Config, fs: Arc<FileSystem>) -> S3Service {
+pub fn build_api_service(config: &Config, fs: Arc<FileSystem>, settings: &SharedSettings) -> S3Service {
     let mut builder = S3ServiceBuilder::new(SharedFileSystem::new(fs));
-    builder.set_host(host_router(config));
+    builder.set_host(host_router(settings));
 
     match config.credentials() {
         Some((access_key, secret_key)) => {
@@ -84,23 +87,23 @@ pub fn build_api_service(config: &Config, fs: Arc<FileSystem>) -> S3Service {
 /// advertised and `PublicReadAccess` disregards it anyway). This keeps the public
 /// port strictly read-only and public-scoped even in credential-less dev mode,
 /// rather than silently degrading to a fully open read/write endpoint.
-pub fn build_public_service(config: &Config, fs: Arc<FileSystem>) -> S3Service {
+pub fn build_public_service(config: &Config, fs: Arc<FileSystem>, settings: &SharedSettings) -> S3Service {
     let mut builder = S3ServiceBuilder::new(SharedFileSystem::new(fs));
-    builder.set_host(host_router(config));
+    builder.set_host(host_router(settings));
     let (access_key, secret_key) = config
         .credentials()
         .unwrap_or_else(|| (Uuid::new_v4().to_string(), Uuid::new_v4().to_string()));
     builder.set_auth(SimpleAuth::from_single(access_key, secret_key));
-    builder.set_access(PublicReadAccess::new(config.public_bucket_set()));
+    builder.set_access(PublicReadAccess::new(Arc::clone(settings)));
     builder.build()
 }
 
 /// Build the **admin panel** service. The [`AdminRoute`] matches every request, so
 /// the whole port is the panel; the S3 backend is reached only through the panel's
 /// own handlers. Requires credentials (callers gate on [`Config::admin_active`]).
-pub fn build_admin_service(config: &Config, fs: Arc<FileSystem>) -> S3Service {
+pub fn build_admin_service(config: &Config, fs: Arc<FileSystem>, settings: &SharedSettings) -> S3Service {
     let mut builder = S3ServiceBuilder::new(SharedFileSystem::new(Arc::clone(&fs)));
-    let state = Arc::new(AdminState::new(fs, config));
+    let state = Arc::new(AdminState::new(fs, config, Arc::clone(settings)));
     builder.set_route(AdminRoute::new(state));
     builder.build()
 }
@@ -152,12 +155,13 @@ pub async fn serve(
 /// — when [`Config::admin_active`] — the admin panel ([`Config::admin_port`]).
 pub async fn run(config: Config) -> io::Result<()> {
     let fs = open_backend(&config)?;
+    let settings = SettingsStore::open(fs.root())?;
 
-    let api = build_api_service(&config, Arc::clone(&fs));
+    let api = build_api_service(&config, Arc::clone(&fs), &settings);
     let api_listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     info!("API listening on http://{}", api_listener.local_addr()?);
 
-    let public = build_public_service(&config, Arc::clone(&fs));
+    let public = build_public_service(&config, Arc::clone(&fs), &settings);
     let public_listener = TcpListener::bind((config.host.as_str(), config.public_port)).await?;
     info!("public endpoint listening on http://{}", public_listener.local_addr()?);
 
@@ -189,7 +193,7 @@ pub async fn run(config: Config) -> io::Result<()> {
 
     match admin_listener {
         Some(admin_listener) => {
-            let admin = build_admin_service(&config, Arc::clone(&fs));
+            let admin = build_admin_service(&config, Arc::clone(&fs), &settings);
             tokio::try_join!(
                 serve(api, api_listener, shutdown()),
                 serve(public, public_listener, shutdown()),
