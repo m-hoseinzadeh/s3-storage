@@ -20,6 +20,13 @@ services:
       # e.g. "files.example.com=assets,cdn.example.com=images"
       S3_DOMAIN_MAP: ${S3_DOMAIN_MAP:-}
 
+      # Embedded web admin panel, served at S3_ADMIN_PATH (default /admin).
+      # Disabled unless S3_ACCESS_KEY/S3_SECRET_KEY are set (log in with those keys).
+      # Do not create a bucket whose name equals S3_ADMIN_PATH (path-style shadowing).
+      S3_ADMIN_ENABLED: ${S3_ADMIN_ENABLED:-false}
+      S3_ADMIN_PATH: ${S3_ADMIN_PATH:-/admin}
+      S3_ADMIN_SESSION_TTL: ${S3_ADMIN_SESSION_TTL:-3600}
+
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Named volume (simple, portable).

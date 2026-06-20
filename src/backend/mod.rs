@@ -15,6 +15,9 @@ mod error;
 mod checksum;
 mod fs;
 mod s3;
+mod shared;
 mod utils;
 
 pub use self::fs::FileSystem;
+pub(crate) use self::fs::ObjectAttributes;
+pub use self::shared::SharedFileSystem;

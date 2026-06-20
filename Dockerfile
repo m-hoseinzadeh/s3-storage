@@ -1,3 +1,13 @@
+# ---- Admin UI build stage ----
+# Builds the React admin panel; the output is embedded into the binary by
+# rust-embed at compile time, so it must exist before the Rust build.
+FROM node:22-slim AS ui
+WORKDIR /ui
+COPY admin-ui/package.json admin-ui/package-lock.json* ./
+RUN npm install
+COPY admin-ui/ ./
+RUN npm run build
+
 # ---- Build stage ----
 # Rust 1.92+ is required (edition 2024). `rust:1-slim-bookworm` tracks latest stable.
 FROM rust:1-slim-bookworm AS builder
@@ -12,8 +22,9 @@ RUN mkdir src \
     && cargo build --release --bin s3-storage 2>/dev/null || true
 RUN rm -rf src
 
-# Build the real sources.
+# Build the real sources, with the built admin UI in place for rust-embed.
 COPY src ./src
+COPY --from=ui /ui/dist ./admin-ui/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release --bin s3-storage
 
 # ---- Runtime stage ----

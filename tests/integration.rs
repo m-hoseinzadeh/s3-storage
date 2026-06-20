@@ -48,6 +48,9 @@ async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>)
         domains: vec![],
         public_buckets,
         domain_map,
+        admin_enabled: false,
+        admin_path: "/admin".to_owned(),
+        admin_session_ttl_secs: 3600,
     };
 
     let service = build_service(&config).unwrap();

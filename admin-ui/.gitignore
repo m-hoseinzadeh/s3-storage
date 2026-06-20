@@ -1,0 +1,6 @@
+node_modules
+*.tsbuildinfo
+# Build output is generated (by `npm run build` / the Docker build). Keep the
+# folder present via .gitkeep so rust-embed can compile from a fresh clone.
+/dist/*
+!/dist/.gitkeep

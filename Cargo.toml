@@ -37,6 +37,14 @@ tokio-util = { version = "0.7", features = ["io"] }
 transform-stream = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
+# Admin panel: embedded SPA assets + session-token signing / constant-time compare.
+# hmac/sha2/subtle are already in the tree via s3s; pinned here as direct deps.
+rust-embed = { version = "8", features = ["mime-guess"] }
+hmac = "=0.13.0-rc.5"
+sha2 = "=0.11.0-rc.5"
+subtle = "2.6"
+time = { version = "0.3", features = ["formatting"] }
+
 # Server + config + logging
 clap = { version = "4", features = ["derive", "env"] }
 hyper = { version = "1", features = ["http1", "http2"] }

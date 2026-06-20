@@ -31,6 +31,19 @@ pub struct FileSystem {
 
 pub(crate) type InternalInfo = serde_json::Map<String, serde_json::Value>;
 
+/// An in-progress multipart upload, reconstructed from the on-disk session files.
+///
+/// `s3s`/this backend does not implement `ListMultipartUploads`, so the admin
+/// panel reconstructs the list by scanning the data root for `.upload-{uuid}.json`
+/// session markers and the matching `*.upload-{uuid}.metadata.json` sidecars.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MultipartUploadInfo {
+    pub upload_id: String,
+    pub bucket: Option<String>,
+    pub key: Option<String>,
+    pub initiated_unix: Option<i64>,
+}
+
 /// Stores standard object attributes alongside user metadata
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObjectAttributes {
@@ -262,6 +275,71 @@ impl FileSystem {
             fs::remove_file(&upload_info_path).await?;
         }
         Ok(())
+    }
+
+    /// List all in-progress multipart uploads by scanning the data root.
+    ///
+    /// Pairs each `.upload-{uuid}.json` session marker with its
+    /// `.bucket-{b64}.object-{b64}.upload-{uuid}.metadata.json` sidecar (when
+    /// present) to recover the target bucket/key, using the marker's mtime as the
+    /// initiation time.
+    pub(crate) async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadInfo>> {
+        use std::collections::HashMap;
+
+        let decode = |s: &str| -> Option<String> {
+            base64_simd::URL_SAFE_NO_PAD
+                .decode_to_vec(s)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+        };
+
+        let mut bucket_key: HashMap<String, (String, String)> = HashMap::new();
+        let mut uploads: Vec<(String, Option<i64>)> = Vec::new();
+
+        let mut rd = fs::read_dir(&self.root).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+
+            if let Some(rest) = name.strip_prefix(".upload-")
+                && let Some(uuid) = rest.strip_suffix(".json")
+            {
+                let initiated = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
+                uploads.push((uuid.to_owned(), initiated));
+            } else if name.starts_with(".bucket-") && name.ends_with(".metadata.json") {
+                // .bucket-{b64}.object-{b64}.upload-{uuid}.metadata.json
+                let parts: Vec<&str> = name.split('.').collect();
+                if parts.len() == 6
+                    && let Some(b) = parts[1].strip_prefix("bucket-")
+                    && let Some(k) = parts[2].strip_prefix("object-")
+                    && let Some(uuid) = parts[3].strip_prefix("upload-")
+                    && let (Some(bucket), Some(key)) = (decode(b), decode(k))
+                {
+                    bucket_key.insert(uuid.to_owned(), (bucket, key));
+                }
+            }
+        }
+
+        let mut result: Vec<MultipartUploadInfo> = uploads
+            .into_iter()
+            .map(|(uuid, initiated)| {
+                let bk = bucket_key.get(&uuid);
+                MultipartUploadInfo {
+                    upload_id: uuid,
+                    bucket: bk.map(|(b, _)| b.clone()),
+                    key: bk.map(|(_, k)| k.clone()),
+                    initiated_unix: initiated,
+                }
+            })
+            .collect();
+        result.sort_by(|a, b| a.upload_id.cmp(&b.upload_id));
+        Ok(result)
     }
 
     /// Write to the filesystem atomically.

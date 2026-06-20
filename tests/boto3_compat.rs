@@ -47,6 +47,9 @@ async fn boto3_sdk_compatibility() {
         domains: vec![],
         public_buckets: vec![],
         domain_map: vec![],
+        admin_enabled: false,
+        admin_path: "/admin".to_owned(),
+        admin_session_ttl_secs: 3600,
     };
 
     let service = build_service(&config).unwrap();

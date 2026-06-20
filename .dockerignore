@@ -5,3 +5,5 @@ data/
 *.md
 docker-compose.yml
 tests/
+admin-ui/node_modules/
+admin-ui/dist/

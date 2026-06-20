@@ -47,6 +47,20 @@ pub struct Config {
     /// comma-separated `S3_DOMAIN_MAP` (e.g. `files.example.com=assets,cdn.foo=img`).
     #[arg(long = "domain-map", env = "S3_DOMAIN_MAP", value_delimiter = ',')]
     pub domain_map: Vec<String>,
+
+    /// Enable the embedded web admin panel. Requires credentials
+    /// (`--access-key`/`--secret-key`) to be configured; otherwise it stays disabled.
+    #[arg(long, env = "S3_ADMIN_ENABLED", default_value_t = false)]
+    pub admin_enabled: bool,
+
+    /// URL path prefix the admin panel is served under. A bucket with this name is
+    /// not reachable path-style while the panel is enabled.
+    #[arg(long, env = "S3_ADMIN_PATH", default_value = "/admin")]
+    pub admin_path: String,
+
+    /// Admin session lifetime in seconds (how long a login stays valid).
+    #[arg(long, env = "S3_ADMIN_SESSION_TTL", default_value_t = 3600)]
+    pub admin_session_ttl_secs: u64,
 }
 
 impl Config {
@@ -63,6 +77,28 @@ impl Config {
     #[must_use]
     pub fn public_bucket_set(&self) -> HashSet<String> {
         self.public_buckets.iter().cloned().collect()
+    }
+
+    /// Whether the admin panel should actually be installed: explicitly enabled
+    /// *and* credentials are configured (there is nothing to authenticate against
+    /// otherwise).
+    #[must_use]
+    pub fn admin_active(&self) -> bool {
+        self.admin_enabled && self.credentials().is_some()
+    }
+
+    /// Normalized admin path prefix: a single leading `/`, no trailing `/`.
+    /// Falls back to `/admin` if the configured value is empty.
+    #[must_use]
+    pub fn admin_prefix(&self) -> String {
+        let trimmed = self.admin_path.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            "/admin".to_owned()
+        } else if let Some(rest) = trimmed.strip_prefix('/') {
+            format!("/{rest}")
+        } else {
+            format!("/{trimmed}")
+        }
     }
 
     /// Parsed `host -> bucket` custom-domain map. Invalid entries are skipped.

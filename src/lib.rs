@@ -6,17 +6,22 @@
 //! wire protocol (SigV4, streaming uploads, XML, multipart dispatch).
 
 mod access;
+mod admin;
 mod backend;
 mod config;
 mod host;
 
 use std::future::Future;
 use std::io;
+use std::sync::Arc;
 
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+
+use crate::admin::{AdminRoute, AdminState};
+use crate::backend::SharedFileSystem;
 
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -30,9 +35,11 @@ pub use crate::host::CustomHost;
 /// Build the configured [`S3Service`], wiring the storage backend, auth, access
 /// control, and host routing.
 pub fn build_service(config: &Config) -> io::Result<S3Service> {
-    let fs = FileSystem::new(&config.root).map_err(|e| io::Error::other(format!("{e:?}")))?;
+    // A single shared backend instance: the public S3 service and the admin panel
+    // must share its atomic temp-file counter to avoid colliding writes.
+    let fs = Arc::new(FileSystem::new(&config.root).map_err(|e| io::Error::other(format!("{e:?}")))?);
 
-    let mut builder = S3ServiceBuilder::new(fs);
+    let mut builder = S3ServiceBuilder::new(SharedFileSystem::new(Arc::clone(&fs)));
 
     // Host routing: always installed so path-style works and custom domains /
     // base-domain virtual-hosting resolve when configured.
@@ -50,6 +57,15 @@ pub fn build_service(config: &Config) -> io::Result<S3Service> {
                  open and unauthenticated; intended for local development only"
             );
         }
+    }
+
+    // Admin panel: only when explicitly enabled *and* credentials exist.
+    if config.admin_active() {
+        let state = Arc::new(AdminState::new(Arc::clone(&fs), config));
+        builder.set_route(AdminRoute::new(state));
+        info!("admin panel enabled at {}", config.admin_prefix());
+    } else if config.admin_enabled {
+        warn!("admin panel requested but disabled: no credentials configured");
     }
 
     Ok(builder.build())

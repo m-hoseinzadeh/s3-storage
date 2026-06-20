@@ -28,6 +28,10 @@ custom-domain routing) are this project's own.
   `DeleteBucket`, `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`,
   `ListObjectsV2`, and multipart (`CreateMultipartUpload` / `UploadPart` /
   `CompleteMultipartUpload` / `AbortMultipartUpload` / `ListParts`).
+- **Web admin panel** (optional) — an embedded React dashboard for buckets, the
+  object browser (upload/download/copy/move/metadata/checksums/presigned links),
+  and multipart sessions. Served from the same binary, no extra service. See
+  [Admin panel](#admin-panel).
 - **Docker-first** — small distroless runtime image, one volume at `/data`.
 
 ## Quick start (Docker Compose)
@@ -63,6 +67,9 @@ All settings are available as CLI flags and environment variables.
 | `S3_PUBLIC_BUCKETS` | `--public-bucket` | —         | Comma-separated buckets that allow anonymous reads. |
 | `S3_DOMAINS`        | `--domain`        | —         | Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. |
 | `S3_DOMAIN_MAP`     | `--domain-map`    | —         | Comma-separated `host=bucket` custom-domain mappings. |
+| `S3_ADMIN_ENABLED`  | `--admin-enabled` | `false`   | Enable the embedded web admin panel (requires credentials). |
+| `S3_ADMIN_PATH`     | `--admin-path`    | `/admin`  | URL path prefix the admin panel is served under. |
+| `S3_ADMIN_SESSION_TTL` | `--admin-session-ttl` | `3600` | Admin session lifetime, in seconds. |
 
 Notes:
 - If `S3_ACCESS_KEY`/`S3_SECRET_KEY` are **unset**, the server runs fully open and
@@ -73,6 +80,38 @@ Notes:
 - **Custom domains** map a `Host` header to a bucket via `S3_DOMAIN_MAP`. Point the
   domain's DNS/your reverse proxy at this server and preserve the original `Host`
   header.
+
+## Admin panel
+
+An optional web admin panel ships inside the binary. Enable it with
+`S3_ADMIN_ENABLED=true` (it also requires `S3_ACCESS_KEY`/`S3_SECRET_KEY` — there
+is nothing to log in with otherwise) and open `http://host:8080/admin`.
+
+```bash
+cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
+# then browse to http://localhost:8080/admin and log in with key / secret
+```
+
+- **Login** uses your S3 access key + secret key; a signed, `HttpOnly` session
+  cookie (lifetime `S3_ADMIN_SESSION_TTL`) keeps you signed in. No SigV4 signing
+  happens in the browser — the panel calls a same-origin JSON API that reuses the
+  storage backend directly, so no CORS setup is needed.
+- **Covers every server feature**: dashboard stats, bucket create/delete with
+  public/private status, an object browser (folder navigation, drag-and-drop
+  upload, download, byte-range, copy/move/rename, batch delete, folders, metadata
+  editor, checksums, presigned GET/PUT share links), and multipart session
+  management (list parts, abort).
+- **Path-style shadowing caveat:** while enabled, the admin path prefix (default
+  `/admin`) is reserved — a bucket with that exact name is not reachable via
+  path-style URLs. Pick a different `S3_ADMIN_PATH`, or avoid naming a bucket
+  `admin`. Virtual-hosted/custom-domain access to such a bucket is unaffected.
+- If credentials are not configured the panel stays disabled (a warning is logged)
+  and the plain S3 API continues to serve open/unauthenticated.
+
+The frontend source lives in `admin-ui/` (React + Vite + Tailwind). The Docker
+build compiles it automatically; for local `cargo run`/`cargo build` a placeholder
+shell is committed, so run `npm --prefix admin-ui install && npm --prefix admin-ui
+run build` to embed the real UI.
 
 ### docker-compose.yml
 
