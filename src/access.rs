@@ -49,9 +49,11 @@ impl S3Access for AccessControl {
 }
 
 /// Access policy for the dedicated public endpoint: regardless of credentials, the
-/// only thing permitted is `GET`/`HEAD` against a configured public bucket. This
-/// keeps the public port strictly read-only and scoped to public buckets, even if a
-/// request happens to carry a valid signature.
+/// only thing permitted is `GET`/`HEAD` of an individual object in a configured
+/// public bucket. Bucket-level listing (`ListObjectsV2`) and bucket enumeration
+/// (`ListBuckets`) are denied, so the public port cannot be used to discover keys —
+/// callers must know the object key. This keeps the port strictly read-only and
+/// public-scoped even if a request carries a valid signature.
 ///
 /// `s3s` runs access checks only when authentication is also configured, so the
 /// public service still installs an auth provider purely to enable this stage.
@@ -72,13 +74,16 @@ impl S3Access for PublicReadAccess {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         let method = cx.method();
         let is_read = *method == Method::GET || *method == Method::HEAD;
+        // `get_object_key()` is `Some` only for an object path (bucket + key); it is
+        // `None` for bucket-level requests, which excludes listing/enumeration.
         if is_read
+            && cx.s3_path().get_object_key().is_some()
             && let Some(bucket) = cx.s3_path().get_bucket_name()
             && self.public_buckets.contains(bucket)
         {
             return Ok(());
         }
 
-        Err(s3_error!(AccessDenied, "Only public-bucket reads are served on this endpoint"))
+        Err(s3_error!(AccessDenied, "Only public-bucket object reads are served on this endpoint"))
     }
 }

@@ -283,7 +283,7 @@ async fn public_port_serves_public_buckets_only() {
     std::fs::create_dir_all(srv.root.join("secret")).unwrap();
     std::fs::write(srv.root.join("secret/data.txt"), b"PRIVATE").unwrap();
 
-    // Anonymous read of a public bucket: allowed.
+    // Anonymous read of a public object: allowed.
     let pub_read = get(a, "/assets/logo.txt");
     assert_eq!(pub_read.status, 200);
     assert_eq!(pub_read.body, b"PUBLIC");
@@ -294,6 +294,9 @@ async fn public_port_serves_public_buckets_only() {
     // Anonymous write even to a public bucket: denied.
     let anon_put = request(a, "PUT", &a.to_string(), "/assets/new.txt", Some(b"nope"));
     assert_eq!(anon_put.status, 403);
+
+    // Bucket-level listing of a public bucket: denied (no key enumeration).
+    assert_eq!(get(a, "/assets?list-type=2").status, 403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
