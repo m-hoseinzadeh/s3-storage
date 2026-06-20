@@ -88,22 +88,26 @@ impl Sessions {
 
     /// `Set-Cookie` value that installs a fresh session token.
     ///
-    /// `Secure` is set so the session cookie is only ever sent over HTTPS (the
-    /// admin panel is intended to live on its own TLS-terminated domain).
-    /// Browsers treat `localhost` as a secure context, so plain-HTTP local
-    /// development still works.
+    /// `Secure` is added only when the request reached us over HTTPS (`secure`).
+    /// A `Secure` cookie is silently dropped by browsers on a non-secure context
+    /// (plain HTTP on anything but `localhost`), which would leave the user unable
+    /// to log in; emitting it conditionally keeps TLS deployments protected while
+    /// still working when the panel is served over plain HTTP.
     #[must_use]
-    pub fn set_cookie(&self, token: &str) -> String {
+    pub fn set_cookie(&self, token: &str, secure: bool) -> String {
+        let secure_attr = if secure { "; Secure" } else { "" };
         format!(
-            "{COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path={}; Max-Age={}",
+            "{COOKIE_NAME}={token}; HttpOnly{secure_attr}; SameSite=Strict; Path={}; Max-Age={}",
             self.cookie_path, self.ttl_secs
         )
     }
 
-    /// `Set-Cookie` value that clears the session token.
+    /// `Set-Cookie` value that clears the session token. `secure` must mirror the
+    /// value used by [`Self::set_cookie`] so the clearing cookie matches.
     #[must_use]
-    pub fn clear_cookie(&self) -> String {
-        format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path={}; Max-Age=0", self.cookie_path)
+    pub fn clear_cookie(&self, secure: bool) -> String {
+        let secure_attr = if secure { "; Secure" } else { "" };
+        format!("{COOKIE_NAME}=; HttpOnly{secure_attr}; SameSite=Strict; Path={}; Max-Age=0", self.cookie_path)
     }
 }
 

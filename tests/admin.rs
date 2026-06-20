@@ -220,6 +220,21 @@ async fn admin_login_and_session() {
     assert_eq!(ok.status, 200);
     let cookie = ok.cookie().expect("login must set a session cookie");
     assert!(cookie.starts_with("s3admin_session="));
+    // Over plain HTTP the cookie must NOT be `Secure`, otherwise the browser
+    // drops it and the next request is unauthenticated ("login required").
+    let set_cookie = ok.header("set-cookie").unwrap();
+    assert!(!set_cookie.contains("Secure"), "plain-HTTP login cookie must not be Secure: {set_cookie}");
+    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
+
+    // Behind a TLS-terminating proxy (X-Forwarded-Proto: https) it must be Secure.
+    let https = request(
+        a,
+        "POST",
+        "/api/login",
+        &[JSON, ("X-Forwarded-Proto", "https")],
+        Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
+    );
+    assert!(https.header("set-cookie").unwrap().contains("Secure"), "HTTPS login cookie must be Secure");
 
     // The cookie authorizes API calls.
     let session = request(a, "GET", "/api/session", &[("Cookie", &cookie)], None);

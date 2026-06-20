@@ -114,11 +114,13 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
 # then browse to http://localhost:8081/ and log in with key / secret
 ```
 
-- **Login** uses your S3 access key + secret key; a signed, `HttpOnly`, `Secure`
-  session cookie (lifetime `S3_ADMIN_SESSION_TTL`) keeps you signed in. Because the
-  cookie is `Secure`, serve the panel over **HTTPS** (terminate TLS at your reverse
-  proxy); `localhost` also works for development, but a plain-HTTP panel on a LAN
-  IP/hostname will fail to keep you logged in. No SigV4 signing
+- **Login** uses your S3 access key + secret key; a signed, `HttpOnly` session
+  cookie (lifetime `S3_ADMIN_SESSION_TTL`) keeps you signed in. The cookie is
+  marked `Secure` only when the request arrives over HTTPS (detected via
+  `X-Forwarded-Proto`, set by a TLS-terminating reverse proxy, or the request
+  scheme), so it works over plain HTTP too — though serving the panel over
+  **HTTPS** is strongly recommended so the session cookie is never sent in the
+  clear. No SigV4 signing
   happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the
   admin port) that reuses the storage backend directly, so no CORS setup is needed.
 - **Covers every server feature**: dashboard stats, bucket create/delete with

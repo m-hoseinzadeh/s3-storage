@@ -30,9 +30,10 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
     let tail: &[&str] = &segs[1..];
 
     // Login and logout are the only unauthenticated endpoints.
+    let secure = request_is_secure(&headers, &uri);
     match (&method, tail) {
-        (&Method::POST, ["login"]) => return finish(login(state, body).await),
-        (&Method::POST, ["logout"]) => return finish(Ok(logout(state))),
+        (&Method::POST, ["login"]) => return finish(login(state, body, secure).await),
+        (&Method::POST, ["logout"]) => return finish(Ok(logout(state, secure))),
         _ => {}
     }
 
@@ -85,21 +86,35 @@ struct LoginBody {
     secret_key: String,
 }
 
-async fn login(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
+async fn login(state: &AdminState, body: Body, secure: bool) -> Result<S3Response<Body>, ApiError> {
     let creds: LoginBody = read_json(body).await?;
     if !state.sessions.verify_credentials(&creds.access_key, &creds.secret_key) {
         return Err(ApiError::unauthorized("invalid access key or secret key"));
     }
     let token = state.sessions.issue();
     let mut resp = json_ok(serde_json::json!({ "ok": true, "access_key": state.access_key }));
-    set_cookie(&mut resp.headers, &state.sessions.set_cookie(&token));
+    set_cookie(&mut resp.headers, &state.sessions.set_cookie(&token, secure));
     Ok(resp)
 }
 
-fn logout(state: &AdminState) -> S3Response<Body> {
+fn logout(state: &AdminState, secure: bool) -> S3Response<Body> {
     let mut resp = json_ok(serde_json::json!({ "ok": true }));
-    set_cookie(&mut resp.headers, &state.sessions.clear_cookie());
+    set_cookie(&mut resp.headers, &state.sessions.clear_cookie(secure));
     resp
+}
+
+/// Whether the original client request reached the server over HTTPS.
+///
+/// Honors `X-Forwarded-Proto` (set by TLS-terminating reverse proxies, possibly a
+/// comma-separated proxy chain whose first entry is the client) and falls back to
+/// the request URI scheme. Drives whether the session cookie gets `Secure`.
+fn request_is_secure(headers: &HeaderMap, uri: &hyper::Uri) -> bool {
+    if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok())
+        && let Some(first) = proto.split(',').next()
+    {
+        return first.trim().eq_ignore_ascii_case("https");
+    }
+    uri.scheme_str() == Some("https")
 }
 
 fn is_authenticated(state: &AdminState, headers: &HeaderMap) -> bool {
