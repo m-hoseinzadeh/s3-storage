@@ -17,13 +17,19 @@ pub struct Config {
     #[arg(long, env = "S3_ROOT", default_value = "/data")]
     pub root: PathBuf,
 
-    /// Address to bind the HTTP listener to.
+    /// Address to bind the HTTP listeners to (shared by all three ports).
     #[arg(long, env = "S3_HOST", default_value = "0.0.0.0")]
     pub host: String,
 
-    /// Port to listen on.
+    /// Port for the authenticated S3 API (SDK clients). Anonymous access is
+    /// rejected here; anonymous public-bucket reads are served on `--public-port`.
     #[arg(long, env = "S3_PORT", default_value_t = 8080)]
     pub port: u16,
+
+    /// Port for the public read-only endpoint: anonymous `GET`/`HEAD` of buckets
+    /// listed in `--public-bucket`. Intended to sit behind a CDN/asset domain.
+    #[arg(long, env = "S3_PUBLIC_PORT", default_value_t = 8082)]
+    pub public_port: u16,
 
     /// Access key for SigV4 authentication. Must be set together with `--secret-key`.
     #[arg(long, env = "S3_ACCESS_KEY")]
@@ -53,14 +59,21 @@ pub struct Config {
     #[arg(long, env = "S3_ADMIN_ENABLED", default_value_t = false)]
     pub admin_enabled: bool,
 
-    /// URL path prefix the admin panel is served under. A bucket with this name is
-    /// not reachable path-style while the panel is enabled.
-    #[arg(long, env = "S3_ADMIN_PATH", default_value = "/admin")]
-    pub admin_path: String,
+    /// Port for the admin panel. The panel (SPA + its JSON API) is served at the
+    /// root of this dedicated port, so it can sit behind its own admin domain.
+    #[arg(long, env = "S3_ADMIN_PORT", default_value_t = 8081)]
+    pub admin_port: u16,
 
     /// Admin session lifetime in seconds (how long a login stays valid).
     #[arg(long, env = "S3_ADMIN_SESSION_TTL", default_value_t = 3600)]
     pub admin_session_ttl_secs: u64,
+
+    /// Public base URL of the S3 API (e.g. `https://api.example.com`), used by the
+    /// admin panel when minting presigned links. Since a SigV4 presigned URL is
+    /// signed over its host, this must be the host SDK clients actually reach. When
+    /// unset, presigning falls back to the admin request's `Host` header.
+    #[arg(long, env = "S3_API_PUBLIC_URL")]
+    pub api_public_url: Option<String>,
 }
 
 impl Config {
@@ -85,20 +98,6 @@ impl Config {
     #[must_use]
     pub fn admin_active(&self) -> bool {
         self.admin_enabled && self.credentials().is_some()
-    }
-
-    /// Normalized admin path prefix: a single leading `/`, no trailing `/`.
-    /// Falls back to `/admin` if the configured value is empty.
-    #[must_use]
-    pub fn admin_prefix(&self) -> String {
-        let trimmed = self.admin_path.trim().trim_end_matches('/');
-        if trimmed.is_empty() {
-            "/admin".to_owned()
-        } else if let Some(rest) = trimmed.strip_prefix('/') {
-            format!("/{rest}")
-        } else {
-            format!("/{trimmed}")
-        }
     }
 
     /// Parsed `host -> bucket` custom-domain map. Invalid entries are skipped.

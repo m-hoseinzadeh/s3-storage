@@ -1,10 +1,10 @@
 //! Embedded web admin panel.
 //!
-//! Installed as an [`s3s::route::S3Route`] so requests under the configured prefix
-//! (default `/admin`) are intercepted *before* path-style bucket resolution. The
-//! panel serves a single-page app and a JSON API (`{prefix}/api/*`) that reuses the
-//! storage backend's `s3s::S3` implementation directly, so it never duplicates
-//! storage logic and stays behaviourally identical to the S3 wire API.
+//! Served on its own dedicated port (see [`crate::Config::admin_port`]) as an
+//! [`s3s::route::S3Route`] that matches every request, so the panel owns the whole
+//! port: it serves a single-page app at `/` and a JSON API under `/api/*` that
+//! reuses the storage backend's `s3s::S3` implementation directly, so it never
+//! duplicates storage logic and stays behaviourally identical to the S3 wire API.
 //!
 //! Authentication is by the server's own access/secret key (see [`auth`]); a signed
 //! session cookie gates every `/api/*` route except login.
@@ -35,10 +35,12 @@ pub struct AdminState {
     pub(crate) sessions: Sessions,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
-    pub(crate) prefix: String,
     pub(crate) public_buckets: Vec<String>,
     pub(crate) domains: Vec<String>,
     pub(crate) domain_map: Vec<String>,
+    /// Public base URL of the S3 API used for presigned links; see
+    /// [`crate::Config::api_public_url`]. `None` falls back to the request `Host`.
+    pub(crate) api_public_url: Option<String>,
     pub(crate) version: &'static str,
 }
 
@@ -48,22 +50,22 @@ impl AdminState {
     #[must_use]
     pub fn new(fs: Arc<FileSystem>, config: &Config) -> Self {
         let (access_key, secret_key) = config.credentials().expect("admin requires credentials");
-        let prefix = config.admin_prefix();
+        // The panel owns the whole port, so the session cookie is scoped to root.
         let sessions = Sessions::new(
             access_key.clone(),
             secret_key.clone(),
             config.admin_session_ttl_secs,
-            prefix.clone(),
+            "/".to_owned(),
         );
         Self {
             fs,
             sessions,
             access_key,
             secret_key,
-            prefix,
             public_buckets: config.public_buckets.clone(),
             domains: config.domains.clone(),
             domain_map: config.domain_map.clone(),
+            api_public_url: config.api_public_url.clone(),
             version: env!("CARGO_PKG_VERSION"),
         }
     }
@@ -92,26 +94,25 @@ impl AdminState {
     }
 }
 
-/// The [`S3Route`] that owns all admin handling.
+/// The [`S3Route`] that owns all admin handling. Installed on the dedicated admin
+/// port, where it matches every request so nothing falls through to S3.
 #[derive(Clone)]
 pub struct AdminRoute {
     state: Arc<AdminState>,
-    prefix: String,
 }
 
 impl AdminRoute {
     #[must_use]
     pub fn new(state: Arc<AdminState>) -> Self {
-        let prefix = state.prefix.clone();
-        Self { state, prefix }
+        Self { state }
     }
 }
 
 #[async_trait]
 impl S3Route for AdminRoute {
-    fn is_match(&self, _method: &Method, uri: &Uri, _headers: &HeaderMap, _ext: &mut Extensions) -> bool {
-        let path = uri.path();
-        path == self.prefix || path.starts_with(&format!("{}/", self.prefix))
+    // The admin port serves only the panel; claim every request.
+    fn is_match(&self, _method: &Method, _uri: &Uri, _headers: &HeaderMap, _ext: &mut Extensions) -> bool {
+        true
     }
 
     // The panel authenticates via its own session cookie, so bypass the default
@@ -121,21 +122,12 @@ impl S3Route for AdminRoute {
     }
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
-        let rel = req.uri.path().strip_prefix(&self.prefix).unwrap_or("").to_owned();
+        let rel = req.uri.path().to_owned();
         if rel.starts_with("/api/") || rel == "/api" {
             Ok(api::dispatch(&self.state, req, &rel).await)
         } else {
-            // Redirect bare `{prefix}` to `{prefix}/` so relative asset URLs resolve.
-            if rel.is_empty() {
-                let mut resp = S3Response::new(Body::empty());
-                resp.status = Some(StatusCode::FOUND);
-                resp.headers.insert(
-                    hyper::header::LOCATION,
-                    HeaderValue::from_str(&format!("{}/", self.prefix))
-                        .unwrap_or_else(|_| HeaderValue::from_static("/admin/")),
-                );
-                return Ok(resp);
-            }
+            // `rel` is "/" or a client-side route; assets::serve maps "/" to
+            // index.html and falls back to the SPA shell for unknown routes.
             Ok(assets::serve(&rel))
         }
     }

@@ -53,6 +53,20 @@ aws --endpoint-url http://localhost:8080 s3 cp s3://demo/hello.txt -
 > For the CLI this is automatic with `--endpoint-url`; SDKs need `force_path_style`
 > (or `addressing_style = "path"`), shown below.
 
+## Endpoints (three ports)
+
+The server runs three single-purpose listeners so each can sit behind its own
+domain/subdomain (e.g. via nginx):
+
+| Port | Default | Serves | Auth |
+|------|---------|--------|------|
+| **API** | `8080` | The full S3 wire protocol for SDK clients (`ListObjects`, `PutObject`, multipart, …). | SigV4 only — **anonymous access is rejected**. |
+| **Admin** | `8081` | The web admin panel + its JSON API, served at the **root** of the port. | Session cookie. |
+| **Public** | `8082` | Anonymous `GET`/`HEAD` of buckets listed in `S3_PUBLIC_BUCKETS`. Ideal for a CDN/asset domain. | None (read-only). |
+
+Anonymous public-bucket reads are served **only** on the public port; the API port
+always requires a valid signature.
+
 ## Configuration
 
 All settings are available as CLI flags and environment variables.
@@ -60,53 +74,60 @@ All settings are available as CLI flags and environment variables.
 | Env var             | Flag              | Default   | Description |
 |---------------------|-------------------|-----------|-------------|
 | `S3_ROOT`           | `--root`          | `/data`   | Data directory (mount a volume here). |
-| `S3_HOST`           | `--host`          | `0.0.0.0` | Bind address. |
-| `S3_PORT`           | `--port`          | `8080`    | Listen port. |
+| `S3_HOST`           | `--host`          | `0.0.0.0` | Bind address (shared by all three ports). |
+| `S3_PORT`           | `--port`          | `8080`    | Authenticated S3 API port. |
+| `S3_ADMIN_PORT`     | `--admin-port`    | `8081`    | Admin panel port (panel served at root). |
+| `S3_PUBLIC_PORT`    | `--public-port`   | `8082`    | Public read-only port (anonymous reads of public buckets). |
 | `S3_ACCESS_KEY`     | `--access-key`    | —         | SigV4 access key (set with the secret). |
 | `S3_SECRET_KEY`     | `--secret-key`    | —         | SigV4 secret key (set with the access key). |
-| `S3_PUBLIC_BUCKETS` | `--public-bucket` | —         | Comma-separated buckets that allow anonymous reads. |
+| `S3_PUBLIC_BUCKETS` | `--public-bucket` | —         | Comma-separated buckets that allow anonymous reads (served on the public port). |
 | `S3_DOMAINS`        | `--domain`        | —         | Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. |
 | `S3_DOMAIN_MAP`     | `--domain-map`    | —         | Comma-separated `host=bucket` custom-domain mappings. |
 | `S3_ADMIN_ENABLED`  | `--admin-enabled` | `false`   | Enable the embedded web admin panel (requires credentials). |
-| `S3_ADMIN_PATH`     | `--admin-path`    | `/admin`  | URL path prefix the admin panel is served under. |
 | `S3_ADMIN_SESSION_TTL` | `--admin-session-ttl` | `3600` | Admin session lifetime, in seconds. |
+| `S3_API_PUBLIC_URL` | `--api-public-url` | —        | Public base URL of the API (e.g. `https://api.example.com`), used by the admin panel for presigned links. |
 
 Notes:
-- If `S3_ACCESS_KEY`/`S3_SECRET_KEY` are **unset**, the server runs fully open and
+- If `S3_ACCESS_KEY`/`S3_SECRET_KEY` are **unset**, the API port runs fully open and
   unauthenticated (handy for local development only).
 - **Access mode is per-bucket and configuration-driven.** A bucket is private by
-  default; list it in `S3_PUBLIC_BUCKETS` to allow anonymous `GET`/`HEAD`. Writes
-  always require a valid signature.
+  default; list it in `S3_PUBLIC_BUCKETS` to allow anonymous `GET`/`HEAD` on the
+  public port. Writes always require a valid signature (API port).
 - **Custom domains** map a `Host` header to a bucket via `S3_DOMAIN_MAP`. Point the
-  domain's DNS/your reverse proxy at this server and preserve the original `Host`
-  header.
+  domain's DNS/your reverse proxy at the public port and preserve the original
+  `Host` header.
+- **Presigned links** are SigV4-signed over their host, so the admin panel must mint
+  them against the host SDK clients actually reach. Set `S3_API_PUBLIC_URL` to the
+  API's public URL; otherwise the panel falls back to its own request `Host`, which
+  is only correct when the admin and API share a host.
 
 ## Admin panel
 
 An optional web admin panel ships inside the binary. Enable it with
 `S3_ADMIN_ENABLED=true` (it also requires `S3_ACCESS_KEY`/`S3_SECRET_KEY` — there
-is nothing to log in with otherwise) and open `http://host:8080/admin`.
+is nothing to log in with otherwise). It is served at the **root of its own port**
+(`S3_ADMIN_PORT`, default `8081`), so open `http://host:8081/`.
 
 ```bash
 cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
-# then browse to http://localhost:8080/admin and log in with key / secret
+# then browse to http://localhost:8081/ and log in with key / secret
 ```
 
 - **Login** uses your S3 access key + secret key; a signed, `HttpOnly` session
   cookie (lifetime `S3_ADMIN_SESSION_TTL`) keeps you signed in. No SigV4 signing
-  happens in the browser — the panel calls a same-origin JSON API that reuses the
-  storage backend directly, so no CORS setup is needed.
+  happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the
+  admin port) that reuses the storage backend directly, so no CORS setup is needed.
 - **Covers every server feature**: dashboard stats, bucket create/delete with
   public/private status, an object browser (folder navigation, drag-and-drop
   upload, download, byte-range, copy/move/rename, batch delete, folders, metadata
   editor, checksums, presigned GET/PUT share links), and multipart session
   management (list parts, abort).
-- **Path-style shadowing caveat:** while enabled, the admin path prefix (default
-  `/admin`) is reserved — a bucket with that exact name is not reachable via
-  path-style URLs. Pick a different `S3_ADMIN_PATH`, or avoid naming a bucket
-  `admin`. Virtual-hosted/custom-domain access to such a bucket is unaffected.
+- **Dedicated port, no path shadowing.** The panel owns its own port, so it never
+  collides with bucket names and you can front it with its own domain. Presigned
+  links it generates target the API port — set `S3_API_PUBLIC_URL` so they point at
+  the host clients actually reach (see [Configuration](#configuration)).
 - If credentials are not configured the panel stays disabled (a warning is logged)
-  and the plain S3 API continues to serve open/unauthenticated.
+  and the API port continues to serve open/unauthenticated.
 
 The frontend source lives in `admin-ui/` (React + Vite + Tailwind). The Docker
 build compiles it automatically; for local `cargo run`/`cargo build` a placeholder
@@ -121,11 +142,13 @@ services:
     build: .
     image: s3-storage:latest
     ports:
-      - "8080:8080"
+      - "8080:8080"   # API
+      - "8081:8081"   # admin panel
+      - "8082:8082"   # public reads
     environment:
       S3_ACCESS_KEY: s3storage
       S3_SECRET_KEY: s3storage-secret
-      S3_PUBLIC_BUCKETS: assets            # anonymous reads on "assets"
+      S3_PUBLIC_BUCKETS: assets            # anonymous reads on "assets" (public port)
       S3_DOMAIN_MAP: files.example.com=assets
       RUST_LOG: info
     volumes:
@@ -140,7 +163,7 @@ volumes:
 
 ```bash
 docker build -t s3-storage .
-docker run -d --name s3-storage -p 8080:8080 \
+docker run -d --name s3-storage -p 8080:8080 -p 8081:8081 -p 8082:8082 \
   -e S3_ACCESS_KEY=s3storage -e S3_SECRET_KEY=s3storage-secret \
   -e S3_PUBLIC_BUCKETS=assets \
   -v s3data:/data \
@@ -184,11 +207,11 @@ let client = aws_sdk_s3::Client::from_conf(conf);
 
 ### Anonymous / public bucket
 
-If `assets` is public, objects are readable without credentials:
+If `assets` is public, objects are readable without credentials on the public port:
 
 ```bash
-curl http://localhost:8080/assets/logo.png
-# or via a mapped custom domain:
+curl http://localhost:8082/assets/logo.png
+# or via a mapped custom domain pointed at the public port:
 curl http://files.example.com/logo.png
 ```
 

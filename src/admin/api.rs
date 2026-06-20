@@ -1,4 +1,4 @@
-//! JSON + streaming API for the admin panel, under `{prefix}/api/*`.
+//! JSON + streaming API for the admin panel, under `/api/*`.
 //!
 //! Every handler (except login) is gated by a valid session cookie. Handlers build
 //! authenticated [`S3Request`]s and call the shared backend, then translate the
@@ -21,7 +21,7 @@ use crate::backend::ObjectAttributes;
 
 const JSON_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
-/// Route a `{prefix}/api/...` request and always produce a response.
+/// Route an `/api/...` request and always produce a response.
 pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str) -> S3Response<Body> {
     let S3Request { input: body, method, uri, headers, .. } = req;
     let query = query_map(&uri);
@@ -119,7 +119,7 @@ fn config(state: &AdminState) -> S3Response<Body> {
         "public_buckets": state.public_buckets,
         "domains": state.domains,
         "domain_map": state.domain_map,
-        "admin_path": state.prefix,
+        "admin_path": "/",
         "version": state.version,
     }))
 }
@@ -448,17 +448,35 @@ fn presign_object(state: &AdminState, q: &Query, headers: &HeaderMap) -> Result<
         return Err(ApiError::bad_request("method must be GET or PUT"));
     }
     let expires = q.opt("expires").and_then(|s| s.parse::<u64>().ok()).unwrap_or(3600).clamp(1, 604_800);
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::bad_request("missing Host header"))?;
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
 
-    let url = presign::presign(&state.access_key, &state.secret_key, scheme, host, &bucket, &key, &method, expires);
+    // The presigned URL must target the S3 API host that clients actually reach.
+    // Prefer the configured public API URL; otherwise fall back to this request's
+    // own Host (correct only when the admin and API share a host).
+    let (scheme, host) = match state.api_public_url.as_deref().map(split_scheme_host) {
+        Some((scheme, host)) => (scheme.to_owned(), host.to_owned()),
+        None => {
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| ApiError::bad_request("missing Host header"))?;
+            let scheme = headers
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("http");
+            (scheme.to_owned(), host.to_owned())
+        }
+    };
+
+    let url = presign::presign(&state.access_key, &state.secret_key, &scheme, &host, &bucket, &key, &method, expires);
     Ok(json_ok(serde_json::json!({ "url": url, "expires_in": expires, "method": method })))
+}
+
+/// Split a configured base URL (`https://api.example.com[/...]`) into its scheme
+/// and host[:port], dropping any path. A missing scheme defaults to `http`.
+fn split_scheme_host(base: &str) -> (&str, &str) {
+    let (scheme, rest) = base.split_once("://").unwrap_or(("http", base));
+    let host = rest.split('/').next().unwrap_or(rest);
+    (scheme, host)
 }
 
 // ---- delete (single + batch) ----

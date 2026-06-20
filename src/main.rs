@@ -22,6 +22,21 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // The three listeners bind distinct ports; catch a misconfiguration here with a
+    // clear message rather than a raw "address already in use" on the second bind.
+    let mut ports = vec![("--port", config.port), ("--public-port", config.public_port)];
+    if config.admin_active() {
+        ports.push(("--admin-port", config.admin_port));
+    }
+    for i in 0..ports.len() {
+        for j in (i + 1)..ports.len() {
+            if ports[i].1 == ports[j].1 {
+                eprintln!("error: {} and {} must use different ports (both {})", ports[i].0, ports[j].0, ports[i].1);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(err) => {

@@ -4,13 +4,22 @@ services:
     image: s3-storage:latest
     container_name: s3-storage
     ports:
-      - "8080:8080"
+      # Three single-purpose ports; front each with its own nginx domain if desired.
+      - "8080:8080"   # API     — authenticated S3 protocol (SDK clients)
+      - "8081:8081"   # admin   — web panel + its API (served at root)
+      - "8082:8082"   # public  — anonymous read-only of public buckets
     environment:
-      # SigV4 credentials. Set both; the server is open/unauthenticated if unset.
+      # SigV4 credentials. Set both; the API is open/unauthenticated if unset.
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3storage}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-s3storage-secret}
 
-      # Comma-separated buckets that allow anonymous (public) reads. Optional.
+      # Listener ports (match the published ports above).
+      S3_PORT: ${S3_PORT:-8080}
+      S3_ADMIN_PORT: ${S3_ADMIN_PORT:-8081}
+      S3_PUBLIC_PORT: ${S3_PUBLIC_PORT:-8082}
+
+      # Comma-separated buckets that allow anonymous (public) reads. Served on the
+      # public port. Optional.
       S3_PUBLIC_BUCKETS: ${S3_PUBLIC_BUCKETS:-}
 
       # Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. Optional.
@@ -20,12 +29,15 @@ services:
       # e.g. "files.example.com=assets,cdn.example.com=images"
       S3_DOMAIN_MAP: ${S3_DOMAIN_MAP:-}
 
-      # Embedded web admin panel, served at S3_ADMIN_PATH (default /admin).
+      # Embedded web admin panel, served at the root of S3_ADMIN_PORT.
       # Disabled unless S3_ACCESS_KEY/S3_SECRET_KEY are set (log in with those keys).
-      # Do not create a bucket whose name equals S3_ADMIN_PATH (path-style shadowing).
       S3_ADMIN_ENABLED: ${S3_ADMIN_ENABLED:-false}
-      S3_ADMIN_PATH: ${S3_ADMIN_PATH:-/admin}
       S3_ADMIN_SESSION_TTL: ${S3_ADMIN_SESSION_TTL:-3600}
+
+      # Public base URL of the API, used by the admin panel for presigned links.
+      # Set to the host SDK clients reach (e.g. https://api.example.com). When
+      # unset, presigning falls back to the admin request's Host header.
+      S3_API_PUBLIC_URL: ${S3_API_PUBLIC_URL:-}
 
       RUST_LOG: ${RUST_LOG:-info}
     volumes:

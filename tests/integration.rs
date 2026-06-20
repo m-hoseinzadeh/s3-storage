@@ -1,10 +1,10 @@
 //! Dependency-free integration tests driving the server over raw HTTP.
 //!
-//! These cover bucket/object CRUD and listing (in open mode, where no request
-//! signing is needed) and the public/private + custom-domain access logic (in
-//! authenticated mode, exercised via anonymous requests). Full SigV4-signed SDK
-//! behaviour, streaming uploads and multipart are covered by the boto3 test
-//! (`tests/boto3_compat.rs`).
+//! These cover bucket/object CRUD and listing on the API service (in open mode,
+//! where no request signing is needed) and the public/private + custom-domain
+//! access logic on the public service (exercised via anonymous requests). Full
+//! SigV4-signed SDK behaviour, streaming uploads and multipart are covered by the
+//! boto3 test (`tests/boto3_compat.rs`).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use s3_storage::{Config, build_service, serve};
+use s3_storage::{Config, build_api_service, build_public_service, open_backend, serve};
+use s3s::service::S3Service;
 
 struct TestServer {
     addr: SocketAddr,
@@ -32,28 +33,31 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>) -> TestServer {
-    let root = unique_dir();
+fn test_config(root: PathBuf, auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>) -> Config {
     let (access_key, secret_key) = if auth {
         (Some("it-access".to_owned()), Some("it-secret".to_owned()))
     } else {
         (None, None)
     };
-    let config = Config {
-        root: root.clone(),
+    Config {
+        root,
         host: "127.0.0.1".to_owned(),
         port: 0,
+        public_port: 0,
         access_key,
         secret_key,
         domains: vec![],
         public_buckets,
         domain_map,
         admin_enabled: false,
-        admin_path: "/admin".to_owned(),
+        admin_port: 0,
         admin_session_ttl_secs: 3600,
-    };
+        api_public_url: None,
+    }
+}
 
-    let service = build_service(&config).unwrap();
+/// Bind a listener and serve `service` on it, returning the live address.
+async fn serve_on(root: PathBuf, service: S3Service) -> TestServer {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -63,12 +67,26 @@ async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>)
         })
         .await;
     });
+    TestServer { addr, root, _shutdown: tx }
+}
 
-    TestServer {
-        addr,
-        root,
-        _shutdown: tx,
-    }
+/// Spawn the authenticated **API** service (anonymous access rejected unless `auth`
+/// is false, in which case it runs fully open for the CRUD tests).
+async fn spawn(auth: bool, public_buckets: Vec<String>, domain_map: Vec<String>) -> TestServer {
+    let root = unique_dir();
+    let config = test_config(root.clone(), auth, public_buckets, domain_map);
+    let service = build_api_service(&config, open_backend(&config).unwrap());
+    serve_on(root, service).await
+}
+
+/// Spawn the **public** read-only service. Credentials are configured (so `s3s`
+/// runs the access stage), but requests are made anonymously: only `GET`/`HEAD` of
+/// public buckets is permitted.
+async fn spawn_public(public_buckets: Vec<String>, domain_map: Vec<String>) -> TestServer {
+    let root = unique_dir();
+    let config = test_config(root.clone(), true, public_buckets, domain_map);
+    let service = build_public_service(&config, open_backend(&config).unwrap());
+    serve_on(root, service).await
 }
 
 struct Resp {
@@ -255,11 +273,11 @@ async fn list_prefix_and_delimiter_open_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_private_anonymous_access() {
-    let srv = spawn(true, vec!["assets".to_owned()], vec![]).await;
+async fn public_port_serves_public_buckets_only() {
+    let srv = spawn_public(vec!["assets".to_owned()], vec![]).await;
     let a = srv.addr;
 
-    // Seed objects directly on disk (auth mode forbids unsigned writes).
+    // Seed objects directly on disk (the public service forbids unsigned writes).
     std::fs::create_dir_all(srv.root.join("assets")).unwrap();
     std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
     std::fs::create_dir_all(srv.root.join("secret")).unwrap();
@@ -279,8 +297,19 @@ async fn public_private_anonymous_access() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_port_rejects_anonymous_even_for_public_buckets() {
+    // The API port is strict: a "public" bucket is irrelevant without a signature.
+    let srv = spawn(true, vec!["assets".to_owned()], vec![]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
+
+    assert_eq!(get(a, "/assets/logo.txt").status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_domain_routes_to_bucket() {
-    let srv = spawn(true, vec!["assets".to_owned()], vec!["files.example.com=assets".to_owned()]).await;
+    let srv = spawn_public(vec!["assets".to_owned()], vec!["files.example.com=assets".to_owned()]).await;
     let a = srv.addr;
     std::fs::create_dir_all(srv.root.join("assets")).unwrap();
     std::fs::write(srv.root.join("assets/index.html"), b"<html>").unwrap();

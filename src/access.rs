@@ -47,3 +47,38 @@ impl S3Access for AccessControl {
         Err(s3_error!(AccessDenied, "Anonymous access is not allowed for this request"))
     }
 }
+
+/// Access policy for the dedicated public endpoint: regardless of credentials, the
+/// only thing permitted is `GET`/`HEAD` against a configured public bucket. This
+/// keeps the public port strictly read-only and scoped to public buckets, even if a
+/// request happens to carry a valid signature.
+///
+/// `s3s` runs access checks only when authentication is also configured, so the
+/// public service still installs an auth provider purely to enable this stage.
+#[derive(Debug)]
+pub struct PublicReadAccess {
+    public_buckets: HashSet<String>,
+}
+
+impl PublicReadAccess {
+    #[must_use]
+    pub fn new(public_buckets: HashSet<String>) -> Self {
+        Self { public_buckets }
+    }
+}
+
+#[async_trait::async_trait]
+impl S3Access for PublicReadAccess {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
+        let method = cx.method();
+        let is_read = *method == Method::GET || *method == Method::HEAD;
+        if is_read
+            && let Some(bucket) = cx.s3_path().get_bucket_name()
+            && self.public_buckets.contains(bucket)
+        {
+            return Ok(());
+        }
+
+        Err(s3_error!(AccessDenied, "Only public-bucket reads are served on this endpoint"))
+    }
+}

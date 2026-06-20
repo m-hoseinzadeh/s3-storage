@@ -9,11 +9,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use s3_storage::{Config, build_service, serve};
+use s3_storage::{Config, build_admin_service, build_api_service, open_backend, serve};
+use s3s::service::S3Service;
 
 struct TestServer {
     addr: SocketAddr,
     _shutdown: oneshot::Sender<()>,
+}
+
+/// An admin service paired with a strict API service over the same data root, used
+/// to verify presigned links (signed for the API host) against the API port.
+struct AdminWithApi {
+    admin: SocketAddr,
+    api: SocketAddr,
+    _admin_shutdown: oneshot::Sender<()>,
+    _api_shutdown: oneshot::Sender<()>,
 }
 
 fn unique_dir() -> PathBuf {
@@ -26,21 +36,26 @@ fn unique_dir() -> PathBuf {
     dir
 }
 
-async fn spawn() -> TestServer {
-    let config = Config {
-        root: unique_dir(),
+fn admin_config(root: PathBuf, api_public_url: Option<String>) -> Config {
+    Config {
+        root,
         host: "127.0.0.1".to_owned(),
         port: 0,
+        public_port: 0,
         access_key: Some("admin-key".to_owned()),
         secret_key: Some("admin-secret".to_owned()),
         domains: vec![],
         public_buckets: vec!["assets".to_owned()],
         domain_map: vec![],
         admin_enabled: true,
-        admin_path: "/admin".to_owned(),
+        admin_port: 0,
         admin_session_ttl_secs: 3600,
-    };
-    let service = build_service(&config).unwrap();
+        api_public_url,
+    }
+}
+
+/// Bind a listener and serve `service`, returning its live address + shutdown.
+async fn serve_service(service: S3Service) -> (SocketAddr, oneshot::Sender<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
@@ -50,7 +65,31 @@ async fn spawn() -> TestServer {
         })
         .await;
     });
+    (addr, tx)
+}
+
+async fn spawn() -> TestServer {
+    let config = admin_config(unique_dir(), None);
+    let service = build_admin_service(&config, open_backend(&config).unwrap());
+    let (addr, tx) = serve_service(service).await;
     TestServer { addr, _shutdown: tx }
+}
+
+/// Spawn an API service first (to learn its address), then an admin service over
+/// the same data root with `api_public_url` pointed at the API, so presigned links
+/// the panel mints can be verified against the API port.
+async fn spawn_with_api() -> AdminWithApi {
+    let root = unique_dir();
+
+    let api_config = admin_config(root.clone(), None);
+    let api_service = build_api_service(&api_config, open_backend(&api_config).unwrap());
+    let (api, api_shutdown) = serve_service(api_service).await;
+
+    let admin_config = admin_config(root, Some(format!("http://{api}")));
+    let admin_service = build_admin_service(&admin_config, open_backend(&admin_config).unwrap());
+    let (admin, admin_shutdown) = serve_service(admin_service).await;
+
+    AdminWithApi { admin, api, _admin_shutdown: admin_shutdown, _api_shutdown: api_shutdown }
 }
 
 struct Resp {
@@ -155,31 +194,26 @@ async fn admin_login_and_session() {
     let srv = spawn().await;
     let a = srv.addr;
 
-    // Bare /admin redirects to /admin/.
-    let redirect = request(a, "GET", "/admin", &[], None);
-    assert_eq!(redirect.status, 302);
-    assert_eq!(redirect.header("location"), Some("/admin/"));
-
-    // The SPA shell is served at /admin/ (and as a fallback for client routes).
-    let index = request(a, "GET", "/admin/", &[], None);
+    // The SPA shell is served at the root (and as a fallback for client routes).
+    let index = request(a, "GET", "/", &[], None);
     assert_eq!(index.status, 200);
     assert!(index.header("content-type").is_some_and(|c| c.contains("text/html")));
     assert!(index.text().contains("<div id=\"root\">"));
-    let spa_fallback = request(a, "GET", "/admin/buckets", &[], None);
+    let spa_fallback = request(a, "GET", "/buckets", &[], None);
     assert_eq!(spa_fallback.status, 200, "client-side routes fall back to index.html");
 
     // Wrong credentials are rejected.
-    let bad = request(a, "POST", "/admin/api/login", &[JSON], Some(br#"{"access_key":"x","secret_key":"y"}"#));
+    let bad = request(a, "POST", "/api/login", &[JSON], Some(br#"{"access_key":"x","secret_key":"y"}"#));
     assert_eq!(bad.status, 401);
 
     // API without a session cookie is rejected.
-    assert_eq!(request(a, "GET", "/admin/api/buckets", &[], None).status, 401);
+    assert_eq!(request(a, "GET", "/api/buckets", &[], None).status, 401);
 
     // Correct credentials issue a session cookie.
     let ok = request(
         a,
         "POST",
-        "/admin/api/login",
+        "/api/login",
         &[JSON],
         Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
     );
@@ -188,7 +222,7 @@ async fn admin_login_and_session() {
     assert!(cookie.starts_with("s3admin_session="));
 
     // The cookie authorizes API calls.
-    let session = request(a, "GET", "/admin/api/session", &[("Cookie", &cookie)], None);
+    let session = request(a, "GET", "/api/session", &[("Cookie", &cookie)], None);
     assert_eq!(session.status, 200);
     assert!(session.text().contains("\"authenticated\":true"));
 }
@@ -200,7 +234,7 @@ async fn admin_object_lifecycle() {
     let login = request(
         a,
         "POST",
-        "/admin/api/login",
+        "/api/login",
         &[JSON],
         Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
     );
@@ -209,10 +243,10 @@ async fn admin_object_lifecycle() {
     let auth_json = [("Cookie", cookie.as_str()), JSON];
 
     // Create buckets.
-    assert_eq!(request(a, "POST", "/admin/api/buckets", &auth_json, Some(br#"{"name":"docs"}"#)).status, 200);
-    assert_eq!(request(a, "POST", "/admin/api/buckets", &auth_json, Some(br#"{"name":"assets"}"#)).status, 200);
+    assert_eq!(request(a, "POST", "/api/buckets", &auth_json, Some(br#"{"name":"docs"}"#)).status, 200);
+    assert_eq!(request(a, "POST", "/api/buckets", &auth_json, Some(br#"{"name":"assets"}"#)).status, 200);
 
-    let buckets = request(a, "GET", "/admin/api/buckets", &auth, None);
+    let buckets = request(a, "GET", "/api/buckets", &auth, None);
     assert_eq!(buckets.status, 200);
     let listing = buckets.text();
     assert!(listing.contains("\"name\":\"docs\""));
@@ -224,48 +258,48 @@ async fn admin_object_lifecycle() {
     let put = request(
         a,
         "PUT",
-        "/admin/api/object/put?bucket=docs&key=hello.txt&content_type=text/plain",
+        "/api/object/put?bucket=docs&key=hello.txt&content_type=text/plain",
         &auth,
         Some(b"hello admin world"),
     );
     assert_eq!(put.status, 200);
 
     // Download round-trip.
-    let got = request(a, "GET", "/admin/api/object/get?bucket=docs&key=hello.txt", &auth, None);
+    let got = request(a, "GET", "/api/object/get?bucket=docs&key=hello.txt", &auth, None);
     assert_eq!(got.status, 200);
     assert_eq!(got.body, b"hello admin world");
 
     // Head metadata.
-    let head = request(a, "GET", "/admin/api/object/head?bucket=docs&key=hello.txt", &auth, None);
+    let head = request(a, "GET", "/api/object/head?bucket=docs&key=hello.txt", &auth, None);
     assert_eq!(head.status, 200);
     assert!(head.text().contains("\"content_length\":17"));
 
     // Listing the bucket shows the object.
-    let objs = request(a, "GET", "/admin/api/objects?bucket=docs&delimiter=/", &auth, None);
+    let objs = request(a, "GET", "/api/objects?bucket=docs&delimiter=/", &auth, None);
     assert!(objs.text().contains("\"key\":\"hello.txt\""));
 
     // Copy into another bucket.
     let copy = request(
         a,
         "POST",
-        "/admin/api/object/copy",
+        "/api/object/copy",
         &auth_json,
         Some(br#"{"src_bucket":"docs","src_key":"hello.txt","dst_bucket":"assets","dst_key":"copy.txt"}"#),
     );
     assert_eq!(copy.status, 200);
-    let assets = request(a, "GET", "/admin/api/objects?bucket=assets", &auth, None);
+    let assets = request(a, "GET", "/api/objects?bucket=assets", &auth, None);
     assert!(assets.text().contains("\"key\":\"copy.txt\""));
 
     // Update metadata, then confirm content-type changed.
     let meta = request(
         a,
         "POST",
-        "/admin/api/object/metadata",
+        "/api/object/metadata",
         &auth_json,
         Some(br#"{"bucket":"docs","key":"hello.txt","content_type":"application/json","metadata":{"team":"infra"}}"#),
     );
     assert_eq!(meta.status, 200);
-    let head2 = request(a, "GET", "/admin/api/object/head?bucket=docs&key=hello.txt", &auth, None);
+    let head2 = request(a, "GET", "/api/object/head?bucket=docs&key=hello.txt", &auth, None);
     assert!(head2.text().contains("\"content_type\":\"application/json\""));
     assert!(head2.text().contains("\"team\":\"infra\""));
 
@@ -273,7 +307,7 @@ async fn admin_object_lifecycle() {
     let del = request(
         a,
         "POST",
-        "/admin/api/objects/delete",
+        "/api/objects/delete",
         &auth_json,
         Some(br#"{"bucket":"docs","keys":["hello.txt"]}"#),
     );
@@ -283,34 +317,36 @@ async fn admin_object_lifecycle() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_presign_round_trip() {
-    let srv = spawn().await;
-    let a = srv.addr;
+    let srv = spawn_with_api().await;
+    let (admin, api) = (srv.admin, srv.api);
     let login = request(
-        a,
+        admin,
         "POST",
-        "/admin/api/login",
+        "/api/login",
         &[JSON],
         Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
     );
     let cookie = login.cookie().unwrap();
     let auth = [("Cookie", cookie.as_str())];
 
-    request(a, "POST", "/admin/api/buckets", &[("Cookie", cookie.as_str()), JSON], Some(br#"{"name":"docs"}"#));
-    request(a, "PUT", "/admin/api/object/put?bucket=docs&key=secret.txt", &auth, Some(b"signed payload"));
+    request(admin, "POST", "/api/buckets", &[("Cookie", cookie.as_str()), JSON], Some(br#"{"name":"docs"}"#));
+    request(admin, "PUT", "/api/object/put?bucket=docs&key=secret.txt", &auth, Some(b"signed payload"));
 
-    // Generate a presigned GET URL.
-    let presign = request(a, "GET", "/admin/api/object/presign?bucket=docs&key=secret.txt&method=GET", &auth, None);
+    // Generate a presigned GET URL; it is signed for the configured API host.
+    let presign = request(admin, "GET", "/api/object/presign?bucket=docs&key=secret.txt&method=GET", &auth, None);
     assert_eq!(presign.status, 200);
     let url = presign.text();
     let url = url.split("\"url\":\"").nth(1).unwrap().split('"').next().unwrap().replace("\\u0026", "&");
+    assert!(url.contains(&api.to_string()), "presigned URL must target the API host: {url}");
 
-    // Strip scheme+host -> path?query, then fetch anonymously (no cookie, no SigV4 header).
+    // Strip scheme+host -> path?query, then fetch from the API port anonymously
+    // (no cookie, no SigV4 header) — the signature alone must authorize it.
     let path_q = url.splitn(4, '/').nth(3).map(|s| format!("/{s}")).unwrap();
-    let anon = request(a, "GET", &path_q, &[], None);
+    let anon = request(api, "GET", &path_q, &[], None);
     assert_eq!(anon.status, 200, "presigned URL must verify: {path_q}");
     assert_eq!(anon.body, b"signed payload");
 
-    // Without the signature, the same private object is forbidden.
-    let unsigned = request(a, "GET", "/docs/secret.txt", &[], None);
+    // Without the signature, the same private object is forbidden on the API port.
+    let unsigned = request(api, "GET", "/docs/secret.txt", &[], None);
     assert_eq!(unsigned.status, 403);
 }

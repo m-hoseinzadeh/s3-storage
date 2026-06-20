@@ -34,12 +34,15 @@ FROM gcr.io/distroless/cc-debian12
 COPY --from=builder /app/target/release/s3-storage /usr/local/bin/s3-storage
 
 # Defaults; override via environment (see README / docker-compose.yml).
+# Three single-purpose ports: API (8080), admin panel (8081), public reads (8082).
 ENV S3_ROOT=/data \
     S3_HOST=0.0.0.0 \
     S3_PORT=8080 \
+    S3_ADMIN_PORT=8081 \
+    S3_PUBLIC_PORT=8082 \
     RUST_LOG=info
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 8080 8081 8082
 
 ENTRYPOINT ["/usr/local/bin/s3-storage"]

@@ -1,6 +1,6 @@
 // Typed client for the admin JSON API. Cookies carry the session, so every
 // request uses `credentials: "include"`. The base path tracks Vite's BASE_URL
-// (`/admin/`) so the API root is `/admin/api`.
+// (`/`, the panel's dedicated port) so the API root is `/api`.
 
 const API = `${import.meta.env.BASE_URL}api`;
 
