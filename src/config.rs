@@ -70,8 +70,9 @@ pub struct Config {
 
     /// Public base URL of the S3 API (e.g. `https://api.example.com`), used by the
     /// admin panel when minting presigned links. Since a SigV4 presigned URL is
-    /// signed over its host, this must be the host SDK clients actually reach. When
-    /// unset, presigning falls back to the admin request's `Host` header.
+    /// signed over its host, this must be the host SDK clients actually reach.
+    /// Required for presigning: when unset the admin panel refuses to mint
+    /// presigned links (it cannot infer the API host from the admin request).
     #[arg(long, env = "S3_API_PUBLIC_URL")]
     pub api_public_url: Option<String>,
 }

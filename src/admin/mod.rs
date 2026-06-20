@@ -39,7 +39,8 @@ pub struct AdminState {
     pub(crate) domains: Vec<String>,
     pub(crate) domain_map: Vec<String>,
     /// Public base URL of the S3 API used for presigned links; see
-    /// [`crate::Config::api_public_url`]. `None` falls back to the request `Host`.
+    /// [`crate::Config::api_public_url`]. Normalized so a blank value is `None`,
+    /// in which case presigning is refused (the panel cannot infer the API host).
     pub(crate) api_public_url: Option<String>,
     pub(crate) version: &'static str,
 }
@@ -65,7 +66,14 @@ impl AdminState {
             public_buckets: config.public_buckets.clone(),
             domains: config.domains.clone(),
             domain_map: config.domain_map.clone(),
-            api_public_url: config.api_public_url.clone(),
+            // Treat a blank value (e.g. an empty `S3_API_PUBLIC_URL` env var, which
+            // clap surfaces as `Some("")`) as unset.
+            api_public_url: config
+                .api_public_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
             version: env!("CARGO_PKG_VERSION"),
         }
     }

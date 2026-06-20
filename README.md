@@ -98,8 +98,9 @@ Notes:
   `Host` header.
 - **Presigned links** are SigV4-signed over their host, so the admin panel must mint
   them against the host SDK clients actually reach. Set `S3_API_PUBLIC_URL` to the
-  API's public URL; otherwise the panel falls back to its own request `Host`, which
-  is only correct when the admin and API share a host.
+  API's public URL. It is **required** to generate presigned links: when unset the
+  panel returns a clear error rather than emitting a link that points at the admin
+  port (which does not serve S3).
 
 ## Admin panel
 

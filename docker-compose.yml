@@ -35,8 +35,8 @@ services:
       S3_ADMIN_SESSION_TTL: ${S3_ADMIN_SESSION_TTL:-3600}
 
       # Public base URL of the API, used by the admin panel for presigned links.
-      # Set to the host SDK clients reach (e.g. https://api.example.com). When
-      # unset, presigning falls back to the admin request's Host header.
+      # Set to the host SDK clients reach (e.g. https://api.example.com). Required
+      # to mint presigned links; when unset the panel returns a clear error.
       S3_API_PUBLIC_URL: ${S3_API_PUBLIC_URL:-}
 
       RUST_LOG: ${RUST_LOG:-info}
