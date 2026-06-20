@@ -1,0 +1,12 @@
+s3-storage
+Copyright 2026 m-hoseinzadeh
+
+This product includes software developed by Nugine and contributors:
+
+  s3s and s3s-fs — https://github.com/Nugine/s3s
+  Copyright 2023 Nugine
+  Licensed under the Apache License, Version 2.0.
+
+The on-disk storage engine under `src/backend/` is derived from the `s3s-fs`
+reference implementation and has been modified for this project (module layout,
+error handling, and integration with this crate's auth/access/host layers).

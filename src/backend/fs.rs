@@ -1,3 +1,7 @@
+// Derived from the Apache-2.0 licensed `s3s-fs` reference implementation
+// (https://github.com/Nugine/s3s, Copyright 2023 Nugine).
+// Modified for this project. See NOTICE and LICENSE.
+
 use crate::backend::error::*;
 use crate::backend::utils::hex;
 

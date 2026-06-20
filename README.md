@@ -174,7 +174,28 @@ cargo test
   compatibility via boto3 (full SigV4, streaming upload, multipart). Automatically
   **skipped** if `python3`/`boto3` are not installed.
 
+## Security & operational notes
+
+This server implements S3 authentication and access control, but like the
+underlying `s3s` adapter it has **no built-in network hardening**. Before exposing
+it to untrusted networks:
+
+- **Terminate TLS** at a reverse proxy (nginx/Caddy/Traefik) and forward to it;
+  preserve the original `Host` header (SigV4 signs it).
+- **Limit upload size / disk usage** — object uploads are streamed to disk with no
+  size cap; an unauthenticated public bucket or a compromised key could fill the
+  volume. Add request-size limits and rate limiting at the proxy, and monitor disk.
+- **Use strong, rotated credentials** via `S3_ACCESS_KEY`/`S3_SECRET_KEY`. Never
+  run with auth disabled (no credentials) on a public network.
+- **Keep public buckets read-only by intent** — anonymous access is limited to
+  `GET`/`HEAD` on buckets you explicitly list in `S3_PUBLIC_BUCKETS`; writes always
+  require a valid signature.
+
+Report vulnerabilities privately via the repository's security contact rather than
+a public issue.
+
 ## License
 
-Apache-2.0. The `src/backend/` storage engine is adapted from
-[`s3s-fs`](https://github.com/Nugine/s3s) (Apache-2.0).
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). The `src/backend/` storage
+engine is derived from [`s3s` / `s3s-fs`](https://github.com/Nugine/s3s)
+(Copyright 2023 Nugine, Apache-2.0) and has been modified for this project.
