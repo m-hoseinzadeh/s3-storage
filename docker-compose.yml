@@ -1,0 +1,32 @@
+services:
+  s3-storage:
+    build: .
+    image: s3-storage:latest
+    container_name: s3-storage
+    ports:
+      - "8080:8080"
+    environment:
+      # SigV4 credentials. Set both; the server is open/unauthenticated if unset.
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3storage}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3storage-secret}
+
+      # Comma-separated buckets that allow anonymous (public) reads. Optional.
+      S3_PUBLIC_BUCKETS: ${S3_PUBLIC_BUCKETS:-}
+
+      # Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. Optional.
+      S3_DOMAINS: ${S3_DOMAINS:-}
+
+      # Comma-separated `host=bucket` custom-domain mappings. Optional.
+      # e.g. "files.example.com=assets,cdn.example.com=images"
+      S3_DOMAIN_MAP: ${S3_DOMAIN_MAP:-}
+
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Named volume (simple, portable).
+      - s3data:/data
+      # Or bind-mount a host directory instead:
+      # - ./data:/data
+    restart: unless-stopped
+
+volumes:
+  s3data:

@@ -1,0 +1,49 @@
+[package]
+name = "s3-storage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Minimal, S3-compatible file server that stores raw objects on disk"
+license = "Apache-2.0"
+
+[lib]
+name = "s3_storage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s3-storage"
+path = "src/main.rs"
+
+[dependencies]
+# Core S3 protocol adapter: SigV4 (header + presigned + streaming/trailer),
+# request routing, XML, multipart dispatch.
+s3s = "0.13"
+
+# Storage backend support crates (the on-disk engine is vendored under src/backend,
+# adapted from the Apache-2.0 `s3s-fs` reference implementation).
+async-trait = "0.1"
+base64-simd = "0.8"
+hex-simd = "0.8"
+bytes = "1"
+futures = { version = "0.3", default-features = false }
+numeric_cast = "0.3"
+path-absolutize = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+stdx = { package = "std-next", version = "0.1.9" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+transform-stream = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+# Server + config + logging
+clap = { version = "4", features = ["derive", "env"] }
+hyper = { version = "1", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "http2", "tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+
+# Integration tests are dependency-free: the raw-HTTP Rust test reuses the crate's
+# own deps, and SDK compatibility is verified against Python boto3 (run from
+# `tests/boto3_compat.rs` when python3 + boto3 are available, else skipped).

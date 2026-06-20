@@ -1,0 +1,83 @@
+//! Runtime configuration, sourced from CLI flags overlaid on environment variables.
+//!
+//! Per-bucket deployment settings (public/private access mode and custom-domain
+//! mapping) are configuration-driven rather than persisted per bucket: this keeps
+//! the data root pure object storage and mirrors how the service is deployed in
+//! practice (behind DNS / a reverse proxy).
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "s3-storage", version, about = "Minimal S3-compatible file server")]
+pub struct Config {
+    /// Root directory where buckets and objects are stored.
+    #[arg(long, env = "S3_ROOT", default_value = "/data")]
+    pub root: PathBuf,
+
+    /// Address to bind the HTTP listener to.
+    #[arg(long, env = "S3_HOST", default_value = "0.0.0.0")]
+    pub host: String,
+
+    /// Port to listen on.
+    #[arg(long, env = "S3_PORT", default_value_t = 8080)]
+    pub port: u16,
+
+    /// Access key for SigV4 authentication. Must be set together with `--secret-key`.
+    #[arg(long, env = "S3_ACCESS_KEY")]
+    pub access_key: Option<String>,
+
+    /// Secret key for SigV4 authentication. Must be set together with `--access-key`.
+    #[arg(long, env = "S3_SECRET_KEY")]
+    pub secret_key: Option<String>,
+
+    /// Base domain(s) enabling virtual-hosted-style access (`<bucket>.<domain>`).
+    /// Repeat the flag or use a comma-separated `S3_DOMAINS`.
+    #[arg(long = "domain", env = "S3_DOMAINS", value_delimiter = ',')]
+    pub domains: Vec<String>,
+
+    /// Buckets that allow anonymous read access. Repeat the flag or use a
+    /// comma-separated `S3_PUBLIC_BUCKETS`.
+    #[arg(long = "public-bucket", env = "S3_PUBLIC_BUCKETS", value_delimiter = ',')]
+    pub public_buckets: Vec<String>,
+
+    /// Custom-domain to bucket mappings as `host=bucket`. Repeat the flag or use a
+    /// comma-separated `S3_DOMAIN_MAP` (e.g. `files.example.com=assets,cdn.foo=img`).
+    #[arg(long = "domain-map", env = "S3_DOMAIN_MAP", value_delimiter = ',')]
+    pub domain_map: Vec<String>,
+}
+
+impl Config {
+    /// Resolved credential pair, if both halves are present.
+    #[must_use]
+    pub fn credentials(&self) -> Option<(String, String)> {
+        match (&self.access_key, &self.secret_key) {
+            (Some(ak), Some(sk)) => Some((ak.clone(), sk.clone())),
+            _ => None,
+        }
+    }
+
+    /// Set of buckets that permit anonymous reads.
+    #[must_use]
+    pub fn public_bucket_set(&self) -> HashSet<String> {
+        self.public_buckets.iter().cloned().collect()
+    }
+
+    /// Parsed `host -> bucket` custom-domain map. Invalid entries are skipped.
+    #[must_use]
+    pub fn parsed_domain_map(&self) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        for entry in &self.domain_map {
+            if let Some((host, bucket)) = entry.split_once('=') {
+                let host = host.trim();
+                let bucket = bucket.trim();
+                if !host.is_empty() && !bucket.is_empty() {
+                    map.insert(host.to_ascii_lowercase(), bucket.to_owned());
+                }
+            }
+        }
+        map
+    }
+}

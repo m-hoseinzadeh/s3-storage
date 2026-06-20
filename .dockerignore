@@ -1,0 +1,7 @@
+target/
+data/
+.git/
+.gitignore
+*.md
+docker-compose.yml
+tests/
