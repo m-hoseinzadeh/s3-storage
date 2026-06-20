@@ -87,10 +87,15 @@ impl Sessions {
     }
 
     /// `Set-Cookie` value that installs a fresh session token.
+    ///
+    /// `Secure` is set so the session cookie is only ever sent over HTTPS (the
+    /// admin panel is intended to live on its own TLS-terminated domain).
+    /// Browsers treat `localhost` as a secure context, so plain-HTTP local
+    /// development still works.
     #[must_use]
     pub fn set_cookie(&self, token: &str) -> String {
         format!(
-            "{COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path={}; Max-Age={}",
+            "{COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path={}; Max-Age={}",
             self.cookie_path, self.ttl_secs
         )
     }
@@ -98,7 +103,7 @@ impl Sessions {
     /// `Set-Cookie` value that clears the session token.
     #[must_use]
     pub fn clear_cookie(&self) -> String {
-        format!("{COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path={}; Max-Age=0", self.cookie_path)
+        format!("{COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path={}; Max-Age=0", self.cookie_path)
     }
 }
 
