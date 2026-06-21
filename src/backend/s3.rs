@@ -173,6 +173,10 @@ impl S3 for FileSystem {
     #[tracing::instrument]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
+        // In quiet mode the response carries only keys whose deletion failed; the
+        // successful ones are omitted. We never report per-key failures here, so a
+        // quiet request yields an empty `Deleted` list.
+        let quiet = input.delete.quiet.unwrap_or(false);
         let mut deleted_objects: Vec<DeletedObject> = Vec::new();
         for object in input.delete.objects {
             let path = self.get_object_path(&input.bucket, &object.key)?;
@@ -182,10 +186,12 @@ impl S3 for FileSystem {
                 try_!(fs::remove_file(path).await);
             }
 
-            deleted_objects.push(DeletedObject {
-                key: Some(object.key),
-                ..Default::default()
-            });
+            if !quiet {
+                deleted_objects.push(DeletedObject {
+                    key: Some(object.key),
+                    ..Default::default()
+                });
+            }
         }
 
         let output = DeleteObjectsOutput {

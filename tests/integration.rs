@@ -325,6 +325,32 @@ async fn list_objects_v2_paginates_with_continuation_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_objects_honors_quiet_mode() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/bulk", None);
+    for key in ["k1", "k2"] {
+        request(a, "PUT", &a.to_string(), &format!("/bulk/{key}"), Some(b"x"));
+    }
+
+    // Non-quiet: every deleted key is echoed back in the result.
+    let verbose_body = b"<Delete><Object><Key>k1</Key></Object></Delete>";
+    let verbose = request(a, "POST", &a.to_string(), "/bulk?delete", Some(verbose_body));
+    assert_eq!(verbose.status, 200);
+    assert!(String::from_utf8_lossy(&verbose.body).contains("<Key>k1</Key>"), "verbose mode lists deleted keys");
+
+    // Quiet: the result must omit the successfully deleted keys.
+    let quiet_body = b"<Delete><Object><Key>k2</Key></Object><Quiet>true</Quiet></Delete>";
+    let quiet = request(a, "POST", &a.to_string(), "/bulk?delete", Some(quiet_body));
+    assert_eq!(quiet.status, 200);
+    assert!(!String::from_utf8_lossy(&quiet.body).contains("<Key>k2</Key>"), "quiet mode omits deleted keys");
+
+    // Both objects are actually gone regardless of mode.
+    assert_eq!(get(a, "/bulk/k1").status, 404);
+    assert_eq!(get(a, "/bulk/k2").status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_port_serves_public_buckets_only() {
     let srv = spawn_public(vec!["assets".to_owned()], vec![]).await;
     let a = srv.addr;
