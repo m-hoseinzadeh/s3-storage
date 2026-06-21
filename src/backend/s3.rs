@@ -100,14 +100,27 @@ impl S3 for FileSystem {
         let file_metadata = try_!(fs::metadata(&src_path).await);
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
 
-        let _ = try_!(fs::copy(&src_path, &dst_path).await);
+        // A copy onto the same path (e.g. a metadata-only `CopyObject` with the same
+        // bucket+key) must not touch the data: `fs::copy(p, p)` truncates the file to
+        // empty, destroying the object. Skip all data/sidecar copies in that case and
+        // leave the existing bytes and metadata untouched.
+        if src_path != dst_path {
+            let _ = try_!(fs::copy(&src_path, &dst_path).await);
 
-        debug!(from = %src_path.display(), to = %dst_path.display(), "copy file");
+            debug!(from = %src_path.display(), to = %dst_path.display(), "copy file");
 
-        let src_metadata_path = self.get_metadata_path(bucket, key, None)?;
-        if src_metadata_path.exists() {
-            let dst_metadata_path = self.get_metadata_path(&input.bucket, &input.key, None)?;
-            let _ = try_!(fs::copy(src_metadata_path, dst_metadata_path).await);
+            let src_metadata_path = self.get_metadata_path(bucket, key, None)?;
+            if src_metadata_path.exists() {
+                let dst_metadata_path = self.get_metadata_path(&input.bucket, &input.key, None)?;
+                let _ = try_!(fs::copy(src_metadata_path, dst_metadata_path).await);
+            }
+
+            // Carry over the checksum sidecar so the copy reports the same checksums.
+            let src_info_path = self.get_internal_info_path(bucket, key)?;
+            if src_info_path.exists() {
+                let dst_info_path = self.get_internal_info_path(&input.bucket, &input.key)?;
+                let _ = try_!(fs::copy(src_info_path, dst_info_path).await);
+            }
         }
 
         let md5_sum = self.get_md5_sum(bucket, key).await?;
@@ -767,6 +780,11 @@ impl S3 for FileSystem {
         let mut src_file = fs::File::open(&src_path).await.map_err(|e| s3_error!(e, NoSuchKey))?;
         let file_len = try_!(src_file.metadata().await).len();
 
+        // An empty source has no bytes to copy; `file_len - 1` below would underflow.
+        if file_len == 0 {
+            return Err(s3_error!(InvalidRequest, "copy source is empty"));
+        }
+
         let (start, end) = if let Some(copy_range) = &input.copy_source_range {
             if !copy_range.starts_with("bytes=") {
                 return Err(s3_error!(InvalidArgument));
@@ -786,6 +804,11 @@ impl S3 for FileSystem {
         } else {
             (0, file_len - 1)
         };
+
+        // Reject a range that runs past the end of the source or is inverted.
+        if start > end || end >= file_len {
+            return Err(s3_error!(InvalidArgument, "copy source range is out of bounds"));
+        }
 
         let content_length = end - start + 1;
         let content_length_usize = try_!(usize::try_from(content_length));

@@ -361,6 +361,19 @@ async fn admin_object_lifecycle() {
     let assets = request(a, "GET", "/api/objects?bucket=assets", &auth, None);
     assert!(assets.text().contains("\"key\":\"copy.txt\""));
 
+    // Copy onto the same bucket+key must preserve the bytes, not truncate them
+    // (`fs::copy(p, p)` empties the file — guard against that regression).
+    let self_copy = request(
+        a,
+        "POST",
+        "/api/object/copy",
+        &auth_json,
+        Some(br#"{"src_bucket":"docs","src_key":"hello.txt","dst_bucket":"docs","dst_key":"hello.txt"}"#),
+    );
+    assert_eq!(self_copy.status, 200);
+    let after = request(a, "GET", "/api/object/get?bucket=docs&key=hello.txt", &auth, None);
+    assert_eq!(after.body, b"hello admin world", "self-copy must not destroy object data");
+
     // Update metadata, then confirm content-type changed.
     let meta = request(
         a,
