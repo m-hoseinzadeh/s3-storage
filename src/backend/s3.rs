@@ -363,6 +363,10 @@ impl S3 for FileSystem {
             prefix: v2.prefix,
             max_keys: v2.max_keys,
             is_truncated: v2.is_truncated,
+            // v1 paginates via marker/next-marker; our token is the last key, which
+            // maps straight onto the v1 marker (itself fed back in as start_after).
+            marker: v2.start_after,
+            next_marker: v2.next_continuation_token,
             ..Default::default()
         }))
     }
@@ -398,18 +402,24 @@ impl S3 for FileSystem {
             lhs_key.cmp(rhs_key)
         });
 
-        // Apply start_after filter if provided
-        if let Some(marker) = &input.start_after {
-            objects.retain(|obj| obj.key.as_deref().unwrap_or("") > marker.as_str());
+        // Resume point: a continuation token takes precedence over start_after, and
+        // both mean "return items strictly after this key". The token we emit below
+        // is simply the last key returned, so the two are interchangeable here.
+        let resume_after = input.continuation_token.as_deref().or(input.start_after.as_deref());
+        if let Some(marker) = resume_after {
+            objects.retain(|obj| obj.key.as_deref().unwrap_or("") > marker);
         }
 
-        // Convert common_prefixes to sorted list
+        // Convert common_prefixes to sorted list, applying the same resume marker so
+        // paginated delimited listings don't repeat a prefix already returned.
         let common_prefixes_list: Vec<CommonPrefix> = common_prefixes
             .into_iter()
+            .filter(|p| resume_after.is_none_or(|m| p.as_str() > m))
             .map(|prefix| CommonPrefix { prefix: Some(prefix) })
             .collect();
 
-        // Limit results to max_keys by interleaving objects and common_prefixes
+        // Limit results to max_keys by interleaving objects and common_prefixes,
+        // tracking the last key emitted so it can serve as the continuation token.
         let mut result_objects = Vec::new();
         let mut result_prefixes = Vec::new();
         let mut total_count = 0;
@@ -417,6 +427,7 @@ impl S3 for FileSystem {
 
         let mut obj_idx = 0;
         let mut prefix_idx = 0;
+        let mut last_key: Option<String> = None;
 
         while total_count < max_keys_usize {
             let obj_key = objects.get(obj_idx).and_then(|o| o.key.as_deref());
@@ -425,20 +436,24 @@ impl S3 for FileSystem {
             match (obj_key, prefix_key) {
                 (Some(ok), Some(pk)) => {
                     if ok < pk {
+                        last_key = Some(ok.to_owned());
                         result_objects.push(objects[obj_idx].clone());
                         obj_idx += 1;
                     } else {
+                        last_key = Some(pk.to_owned());
                         result_prefixes.push(common_prefixes_list[prefix_idx].clone());
                         prefix_idx += 1;
                     }
                     total_count += 1;
                 }
-                (Some(_), None) => {
+                (Some(ok), None) => {
+                    last_key = Some(ok.to_owned());
                     result_objects.push(objects[obj_idx].clone());
                     obj_idx += 1;
                     total_count += 1;
                 }
-                (None, Some(_)) => {
+                (None, Some(pk)) => {
+                    last_key = Some(pk.to_owned());
                     result_prefixes.push(common_prefixes_list[prefix_idx].clone());
                     prefix_idx += 1;
                     total_count += 1;
@@ -448,6 +463,8 @@ impl S3 for FileSystem {
         }
 
         let is_truncated = obj_idx < objects.len() || prefix_idx < common_prefixes_list.len();
+        // Only hand back a continuation token when there is more to fetch.
+        let next_continuation_token = if is_truncated { last_key } else { None };
         let key_count = try_!(i32::try_from(total_count));
 
         let contents = result_objects.is_empty().not().then_some(result_objects);
@@ -463,6 +480,9 @@ impl S3 for FileSystem {
             encoding_type: input.encoding_type,
             name: Some(input.bucket),
             prefix: input.prefix,
+            continuation_token: input.continuation_token,
+            next_continuation_token,
+            start_after: input.start_after,
             ..Default::default()
         };
         Ok(S3Response::new(output))

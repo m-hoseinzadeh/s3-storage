@@ -287,6 +287,45 @@ async fn list_prefix_and_delimiter_open_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_objects_v2_paginates_with_continuation_token() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/paged", None);
+    for key in ["k1", "k2", "k3", "k4", "k5"] {
+        request(a, "PUT", &a.to_string(), &format!("/paged/{key}"), Some(b"x"));
+    }
+
+    // First page of 2: truncated, with a continuation token.
+    let p1 = get(a, "/paged?list-type=2&max-keys=2");
+    let x1 = String::from_utf8_lossy(&p1.body);
+    assert!(x1.contains("<Key>k1</Key>") && x1.contains("<Key>k2</Key>"), "page 1: {x1}");
+    assert!(x1.contains("<IsTruncated>true</IsTruncated>"), "page 1 must be truncated: {x1}");
+    let token_start = x1.find("<NextContinuationToken>").expect("page 1 must carry a token") + "<NextContinuationToken>".len();
+    let token_end = x1[token_start..].find("</NextContinuationToken>").unwrap() + token_start;
+    let token = &x1[token_start..token_end];
+
+    // Walk the rest using the token; we must reach k5 and terminate.
+    let mut seen = vec!["k1".to_owned(), "k2".to_owned()];
+    let mut next = token.to_owned();
+    for _ in 0..10 {
+        let resp = get(a, &format!("/paged?list-type=2&max-keys=2&continuation-token={next}"));
+        let xml = String::from_utf8_lossy(&resp.body);
+        for k in ["k3", "k4", "k5"] {
+            if xml.contains(&format!("<Key>{k}</Key>")) && !seen.iter().any(|s| s == k) {
+                seen.push(k.to_owned());
+            }
+        }
+        if xml.contains("<IsTruncated>false</IsTruncated>") {
+            break;
+        }
+        let s = xml.find("<NextContinuationToken>").expect("truncated page needs a token") + "<NextContinuationToken>".len();
+        let e = xml[s..].find("</NextContinuationToken>").unwrap() + s;
+        next = xml[s..e].to_owned();
+    }
+    assert_eq!(seen, vec!["k1", "k2", "k3", "k4", "k5"], "pagination must enumerate every key exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_port_serves_public_buckets_only() {
     let srv = spawn_public(vec!["assets".to_owned()], vec![]).await;
     let a = srv.addr;
