@@ -70,7 +70,7 @@ export function Layout() {
             Sign out
           </Button>
           <div className="mono mt-2 px-2 text-center text-[11px] text-[var(--color-faint-fg)]">
-            v{__APP_VERSION__}
+            {__APP_VERSION__}
           </div>
         </div>
       </aside>
