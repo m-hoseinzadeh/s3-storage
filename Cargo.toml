@@ -37,6 +37,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 transform-stream = "0.3"
 uuid = { version = "1", features = ["v4"] }
 
+# Server-side ZIP extraction for the admin panel's "Extract archive" action.
+# default-features disabled so we pull only the deflate (flate2/rust_backend) codec
+# — the format virtually every `.zip` uses — and skip the bzip2/zstd/aes C deps.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # Admin panel: embedded SPA assets + session-token signing / constant-time compare.
 # hmac/sha2/subtle are already in the tree via s3s; pinned here as direct deps.
 rust-embed = { version = "8", features = ["mime-guess"] }
@@ -57,6 +62,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "h
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 
-# Integration tests are dependency-free: the raw-HTTP Rust test reuses the crate's
-# own deps, and SDK compatibility is verified against Python boto3 (run from
-# `tests/boto3_compat.rs` when python3 + boto3 are available, else skipped).
+# Integration tests are dependency-free except `zip`, which the admin extract test
+# uses to author archives; SDK compatibility is verified against Python boto3 (run
+# from `tests/boto3_compat.rs` when python3 + boto3 are available, else skipped).
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -108,6 +108,14 @@ export interface ObjectHead {
   checksums: Record<string, string | null>;
 }
 
+export interface ExtractResult {
+  ok: boolean;
+  extracted: string[];
+  skipped: string[];
+  extracted_count: number;
+  skipped_count: number;
+}
+
 export interface UploadSession {
   upload_id: string;
   bucket?: string;
@@ -173,6 +181,8 @@ export const api = {
     metadata?: Record<string, string>;
   }) => call<{ ok: boolean }>("/object/metadata", jsonBody(data)),
   createFolder: (bucket: string, prefix: string) => call<{ ok: boolean }>("/folder", jsonBody({ bucket, prefix })),
+  extract: (bucket: string, key: string, dest_prefix: string, overwrite: boolean) =>
+    call<ExtractResult>("/object/extract", jsonBody({ bucket, key, dest_prefix, overwrite })),
   presign: (bucket: string, key: string, method: "GET" | "PUT", expires: number) =>
     call<{ url: string; expires_in: number; method: string }>(
       `/object/presign?${qs({ bucket, key, method, expires })}`,

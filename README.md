@@ -145,6 +145,13 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   upload, download, byte-range, copy/move/rename, batch delete, folders, metadata
   editor, checksums, presigned GET/PUT share links), and multipart session
   management (list parts, abort).
+- **Extract ZIP archives server-side.** Any `.zip` object shows an *Extract*
+  action that unpacks it into individual objects in the same bucket — each file
+  becomes its own object, archive folders are preserved as key prefixes, and a
+  Content-Type is guessed per extension (so unpacked static sites serve correctly).
+  Choose a destination prefix and whether to overwrite existing objects; the
+  archive itself is left in place. Extraction is bounded against zip-slip paths and
+  oversized/zip-bomb archives.
 - **Dedicated port, no path shadowing.** The panel owns its own port, so it never
   collides with bucket names and you can front it with its own domain. Presigned
   links it generates target the API port — set the **public API URL** in the panel

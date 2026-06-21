@@ -14,6 +14,7 @@ import {
   Home,
   Database,
   Copy as CopyIcon,
+  FileArchive,
   X,
 } from "lucide-react";
 import {
@@ -65,6 +66,7 @@ export function Browser() {
   const [folderName, setFolderName] = useState("");
   const [details, setDetails] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<string | null>(null);
+  const [extract, setExtract] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -326,6 +328,11 @@ export function Browser() {
                       <a href={api.downloadUrl(bucket, o.key)} className="focusable rounded p-2 text-[var(--color-muted-fg)] hover:bg-[var(--color-bg)] hover:text-[var(--color-fg)]" aria-label="Download" title="Download">
                         <Download className="h-4 w-4" />
                       </a>
+                      {o.key.toLowerCase().endsWith(".zip") && (
+                        <button onClick={() => setExtract(o.key)} className="focusable rounded p-2 text-[var(--color-muted-fg)] hover:bg-[var(--color-bg)] hover:text-[var(--color-fg)] cursor-pointer" aria-label="Extract" title="Extract archive">
+                          <FileArchive className="h-4 w-4" />
+                        </button>
+                      )}
                       <button onClick={() => setDetails(o.key)} className="focusable rounded p-2 text-[var(--color-muted-fg)] hover:bg-[var(--color-bg)] hover:text-[var(--color-fg)] cursor-pointer" aria-label="Details" title="Details, metadata & share">
                         <Info className="h-4 w-4" />
                       </button>
@@ -409,6 +416,10 @@ export function Browser() {
 
       {transfer && (
         <TransferModal bucket={bucket} objectKey={transfer} buckets={buckets} onClose={() => setTransfer(null)} onDone={() => { setTransfer(null); load(); }} />
+      )}
+
+      {extract && (
+        <ExtractModal bucket={bucket} objectKey={extract} onClose={() => setExtract(null)} onDone={() => { setExtract(null); load(); }} />
       )}
 
       <ConfirmModal
@@ -642,6 +653,73 @@ function TransferModal({
       <label className="flex cursor-pointer items-center gap-2 text-sm">
         <input type="checkbox" checked={move} onChange={(e) => setMove(e.target.checked)} className="accent-[var(--color-accent)]" />
         Delete the original after copying (move)
+      </label>
+    </Modal>
+  );
+}
+
+// ---- Extract ZIP archive ----
+
+function ExtractModal({
+  bucket,
+  objectKey,
+  onClose,
+  onDone,
+}: {
+  bucket: string;
+  objectKey: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  // Default to a folder named after the archive, beside it: "a/b/site.zip" -> "a/b/site/".
+  const parent = objectKey.includes("/") ? objectKey.slice(0, objectKey.lastIndexOf("/") + 1) : "";
+  const stem = basename(objectKey).replace(/\.zip$/i, "");
+  const [dest, setDest] = useState(`${parent}${stem}/`);
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const toast = useToast();
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      const r = await api.extract(bucket, objectKey, dest.trim(), overwrite);
+      const msg =
+        r.skipped_count > 0
+          ? `Extracted ${r.extracted_count} file(s), skipped ${r.skipped_count} existing`
+          : `Extracted ${r.extracted_count} file(s)`;
+      toast("success", msg);
+      onDone();
+    } catch (e) {
+      toast("error", e instanceof ApiError ? e.message : "Extraction failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Extract archive"
+      description={`Unpack ${basename(objectKey)} into individual objects in this bucket.`}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" onClick={run} loading={busy}>
+            <FileArchive className="h-4 w-4" /> Extract
+          </Button>
+        </>
+      }
+    >
+      <Field label="Destination prefix (folder)">
+        <Input value={dest} onChange={(e) => setDest(e.target.value)} placeholder="leave blank for bucket root" className="mono" autoFocus />
+      </Field>
+      <p className="-mt-1 mb-3 text-xs text-[var(--color-faint-fg)]">
+        Folders inside the archive are preserved. The archive itself is left in place.
+      </p>
+      <label className="flex cursor-pointer items-center gap-2 text-sm">
+        <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} className="accent-[var(--color-accent)]" />
+        Overwrite objects that already exist
       </label>
     </Modal>
   );

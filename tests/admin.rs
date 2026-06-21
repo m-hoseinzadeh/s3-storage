@@ -399,6 +399,109 @@ async fn admin_object_lifecycle() {
     assert!(del.text().contains("\"deleted\":[\"hello.txt\"]"));
 }
 
+/// Build an in-memory ZIP (deflate) from `(name, bytes)` entries.
+fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let mut w = zip::ZipWriter::new(&mut buf);
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in entries {
+        w.start_file(*name, opts).unwrap();
+        w.write_all(data).unwrap();
+    }
+    w.finish().unwrap();
+    buf.into_inner()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_zip_extract() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let auth = [("Cookie", cookie.as_str())];
+    let auth_json = [("Cookie", cookie.as_str()), JSON];
+
+    request(a, "POST", "/api/buckets", &auth_json, Some(br#"{"name":"site"}"#));
+
+    // Upload an archive with a nested folder.
+    let zip = make_zip(&[("index.html", b"<h1>hi</h1>"), ("css/app.css", b"body{}")]);
+    let put = request(a, "PUT", "/api/object/put?bucket=site&key=bundle.zip", &auth, Some(&zip));
+    assert_eq!(put.status, 200);
+
+    // Extract into "web/".
+    let ex = request(
+        a,
+        "POST",
+        "/api/object/extract",
+        &auth_json,
+        Some(br#"{"bucket":"site","key":"bundle.zip","dest_prefix":"web/"}"#),
+    );
+    assert_eq!(ex.status, 200, "{}", ex.text());
+    assert!(ex.text().contains("\"extracted_count\":2"), "{}", ex.text());
+
+    // Each entry became its own object; folders are preserved as key prefixes and
+    // the content type is guessed from the extension.
+    let html = request(a, "GET", "/api/object/get?bucket=site&key=web/index.html", &auth, None);
+    assert_eq!(html.status, 200);
+    assert_eq!(html.body, b"<h1>hi</h1>");
+    assert!(html.header("content-type").is_some_and(|c| c.contains("text/html")), "{:?}", html.header("content-type"));
+
+    let css = request(a, "GET", "/api/object/get?bucket=site&key=web/css/app.css", &auth, None);
+    assert_eq!(css.status, 200);
+    assert_eq!(css.body, b"body{}");
+
+    // The archive itself is left in place.
+    assert_eq!(request(a, "GET", "/api/object/head?bucket=site&key=bundle.zip", &auth, None).status, 200);
+
+    // Re-extracting without overwrite skips both existing files.
+    let again = request(
+        a,
+        "POST",
+        "/api/object/extract",
+        &auth_json,
+        Some(br#"{"bucket":"site","key":"bundle.zip","dest_prefix":"web/"}"#),
+    );
+    assert_eq!(again.status, 200, "{}", again.text());
+    assert!(again.text().contains("\"skipped_count\":2"), "{}", again.text());
+    assert!(again.text().contains("\"extracted_count\":0"), "{}", again.text());
+
+    // A non-archive object is rejected as a bad request, not a 500.
+    request(a, "PUT", "/api/object/put?bucket=site&key=notes.txt", &auth, Some(b"not a zip"));
+    let bad = request(
+        a,
+        "POST",
+        "/api/object/extract",
+        &auth_json,
+        Some(br#"{"bucket":"site","key":"notes.txt"}"#),
+    );
+    assert_eq!(bad.status, 400, "{}", bad.text());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_zip_extract_rejects_zip_slip() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let auth = [("Cookie", cookie.as_str())];
+    let auth_json = [("Cookie", cookie.as_str()), JSON];
+
+    request(a, "POST", "/api/buckets", &auth_json, Some(br#"{"name":"slip"}"#));
+
+    // An entry that tries to escape the destination with `..` must be refused.
+    let zip = make_zip(&[("../../etc/evil.txt", b"pwned")]);
+    let put = request(a, "PUT", "/api/object/put?bucket=slip&key=evil.zip", &auth, Some(&zip));
+    assert_eq!(put.status, 200);
+
+    let r = request(
+        a,
+        "POST",
+        "/api/object/extract",
+        &auth_json,
+        Some(br#"{"bucket":"slip","key":"evil.zip","dest_prefix":"out/"}"#),
+    );
+    assert_eq!(r.status, 400, "zip-slip path must be rejected: {}", r.text());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_presign_round_trip() {
     let srv = spawn_with_api().await;

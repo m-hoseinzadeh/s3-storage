@@ -65,6 +65,7 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
         (&Method::PUT, ["object", "put"]) => put_object(state, &query, &headers, body).await,
         (&Method::POST, ["object", "copy"]) => copy_object(state, body, false).await,
         (&Method::POST, ["object", "move"]) => copy_object(state, body, true).await,
+        (&Method::POST, ["object", "extract"]) => extract_object(state, body).await,
         (&Method::POST, ["object", "metadata"]) => update_metadata(state, body).await,
         (&Method::GET, ["object", "presign"]) => presign_object(state, &query),
         (&Method::DELETE, ["object"]) => delete_object(state, &query).await,
@@ -433,6 +434,186 @@ async fn copy_object(state: &AdminState, body: Body, remove_source: bool) -> Res
         state.fs.delete_object(state.s3_request(del)).await?;
     }
     Ok(json_ok(serde_json::json!({ "ok": true })))
+}
+
+// ---- archive extraction ----
+
+/// Largest compressed archive we will read back from storage into memory (1 GiB).
+const MAX_ZIP_BYTES: usize = 1024 * 1024 * 1024;
+/// Cap on the total decompressed payload, enforced against *actual* bytes read
+/// (not the archive's self-declared sizes) so a zip bomb can't blow up memory.
+const MAX_TOTAL_UNCOMPRESSED: u64 = 4 * 1024 * 1024 * 1024;
+/// Cap on the number of files a single archive may expand into.
+const MAX_ENTRIES: usize = 50_000;
+
+#[derive(serde::Deserialize)]
+struct ExtractBody {
+    bucket: String,
+    key: String,
+    /// Where extracted files land, e.g. `site/`. Defaults to the bucket root.
+    #[serde(default)]
+    dest_prefix: Option<String>,
+    /// Replace objects that already exist; when false (default) they are skipped.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// A single decompressed file, named with the destination prefix already applied.
+struct ZipEntry {
+    name: String,
+    data: Vec<u8>,
+}
+
+/// Extract a stored `.zip` object into individual objects in the same bucket.
+///
+/// The archive is read back from storage, decompressed off the async runtime, and
+/// each file entry is written as its own object under `dest_prefix`. Directory
+/// entries become implicit S3 prefixes (we never write the folder placeholders).
+/// Paths are validated against zip-slip and bounded by the size/count caps above.
+async fn extract_object(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let b: ExtractBody = read_json(body).await?;
+    if b.key.ends_with('/') {
+        return Err(ApiError::bad_request("the selected key is a folder, not an archive"));
+    }
+
+    // Pull the archive object back out of storage.
+    let input = GetObjectInput { bucket: b.bucket.clone(), key: b.key.clone(), ..Default::default() };
+    let out = state.fs.get_object(state.s3_request(input)).await?.output;
+    let blob = out.body.ok_or_else(|| ApiError::internal("archive object has no body"))?;
+    let mut blob_body: Body = blob.into();
+    let archive = blob_body.store_all_limited(MAX_ZIP_BYTES).await.map_err(|_| {
+        ApiError::bad_request(format!(
+            "archive exceeds the {} MiB extraction limit",
+            MAX_ZIP_BYTES / (1024 * 1024)
+        ))
+    })?;
+
+    // Normalise the destination prefix: never absolute, always ends with '/'.
+    let dest = b.dest_prefix.unwrap_or_default();
+    let dest = dest.trim_start_matches('/').to_owned();
+    let dest = if dest.is_empty() || dest.ends_with('/') { dest } else { format!("{dest}/") };
+
+    // ZIP parsing + inflate is blocking and CPU-bound; keep it off the runtime.
+    let dest_for_task = dest.clone();
+    let entries = tokio::task::spawn_blocking(move || decompress_zip(&archive, &dest_for_task))
+        .await
+        .map_err(|e| ApiError::internal(format!("extraction task failed: {e}")))?
+        .map_err(ApiError::bad_request)?;
+
+    // Write each extracted file as its own object.
+    let mut extracted = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in entries {
+        if !b.overwrite {
+            let head = HeadObjectInput { bucket: b.bucket.clone(), key: entry.name.clone(), ..Default::default() };
+            if state.fs.head_object(state.s3_request(head)).await.is_ok() {
+                skipped.push(entry.name);
+                continue;
+            }
+        }
+        let len = i64::try_from(entry.data.len()).unwrap_or(i64::MAX);
+        let put = PutObjectInput {
+            bucket: b.bucket.clone(),
+            key: entry.name.clone(),
+            body: Some(Body::from(entry.data).into()),
+            content_type: guess_content_type(&entry.name),
+            content_length: Some(len),
+            ..Default::default()
+        };
+        state.fs.put_object(state.s3_request(put)).await?;
+        extracted.push(entry.name);
+    }
+
+    Ok(json_ok(serde_json::json!({
+        "ok": true,
+        "extracted": extracted,
+        "skipped": skipped,
+        "extracted_count": extracted.len(),
+        "skipped_count": skipped.len(),
+    })))
+}
+
+/// Decompress every file entry in `archive`, prefixing each name with `dest`.
+/// Runs inside `spawn_blocking`. Returns a user-facing error string on any
+/// malformed entry, unsafe path, or breach of the size/count caps.
+fn decompress_zip(archive: &[u8], dest: &str) -> Result<Vec<ZipEntry>, String> {
+    use std::io::Read;
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
+        .map_err(|e| format!("not a valid ZIP archive: {e}"))?;
+    if zip.len() > MAX_ENTRIES {
+        return Err(format!("archive has too many entries (limit {MAX_ENTRIES})"));
+    }
+
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+    for i in 0..zip.len() {
+        let file = zip.by_index(i).map_err(|e| format!("failed to read entry {i}: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        // `enclosed_name` rejects absolute paths and `..` traversal (zip-slip).
+        let rel = file
+            .enclosed_name()
+            .ok_or_else(|| format!("archive contains an unsafe path: {}", file.name()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel.is_empty() {
+            continue;
+        }
+
+        // Read at most the remaining budget plus one byte, so an entry whose header
+        // under-reports its size can't slip past the cap.
+        let remaining = MAX_TOTAL_UNCOMPRESSED - total;
+        let mut data = Vec::new();
+        file.take(remaining + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("failed to decompress {rel}: {e}"))?;
+        if data.len() as u64 > remaining {
+            return Err(format!(
+                "extracted size exceeds the {} MiB limit",
+                MAX_TOTAL_UNCOMPRESSED / (1024 * 1024)
+            ));
+        }
+        total += data.len() as u64;
+        entries.push(ZipEntry { name: format!("{dest}{rel}"), data });
+    }
+
+    if entries.is_empty() {
+        return Err("archive contains no files to extract".to_owned());
+    }
+    Ok(entries)
+}
+
+/// Best-effort Content-Type from a file extension, so extracted sites/assets are
+/// served correctly. Unknown extensions fall back to the storage default.
+fn guess_content_type(name: &str) -> Option<String> {
+    let (_, ext) = name.rsplit_once('.')?;
+    let ct = match ext.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "txt" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        _ => return None,
+    };
+    Some(ct.to_owned())
 }
 
 // ---- metadata update ----
