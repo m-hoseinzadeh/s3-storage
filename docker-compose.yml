@@ -18,26 +18,18 @@ services:
       S3_ADMIN_PORT: ${S3_ADMIN_PORT:-8081}
       S3_PUBLIC_PORT: ${S3_PUBLIC_PORT:-8082}
 
-      # Comma-separated buckets that allow anonymous (public) reads. Served on the
-      # public port. Optional.
-      S3_PUBLIC_BUCKETS: ${S3_PUBLIC_BUCKETS:-}
-
-      # Comma-separated base domains for `<bucket>.<domain>` virtual-hosting. Optional.
-      S3_DOMAINS: ${S3_DOMAINS:-}
-
-      # Comma-separated `host=bucket` custom-domain mappings. Optional.
-      # e.g. "files.example.com=assets,cdn.example.com=images"
-      S3_DOMAIN_MAP: ${S3_DOMAIN_MAP:-}
-
       # Embedded web admin panel, served at the root of S3_ADMIN_PORT.
       # Disabled unless S3_ACCESS_KEY/S3_SECRET_KEY are set (log in with those keys).
       S3_ADMIN_ENABLED: ${S3_ADMIN_ENABLED:-false}
-      S3_ADMIN_SESSION_TTL: ${S3_ADMIN_SESSION_TTL:-3600}
 
-      # Public base URL of the API, used by the admin panel for presigned links.
-      # Set to the host SDK clients reach (e.g. https://api.example.com). Required
-      # to mint presigned links; when unset the panel returns a clear error.
-      S3_API_PUBLIC_URL: ${S3_API_PUBLIC_URL:-}
+      # NOTE: the deployment-facing settings below are NOT environment variables.
+      # They are stored in the settings DB under /data and managed live from the
+      # admin panel (enable it with S3_ADMIN_ENABLED above):
+      #   - public buckets (anonymous reads on the public port)
+      #   - base domains for `<bucket>.<domain>` virtual-hosting
+      #   - `host=bucket` custom-domain mappings
+      #   - the public API URL used to mint presigned links
+      #   - the admin session TTL
 
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
