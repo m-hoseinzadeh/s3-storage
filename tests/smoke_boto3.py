@@ -78,11 +78,19 @@ def main() -> int:
     for n, data in [(1, part1), (2, part2)]:
         up = s3.upload_part(Bucket=bucket, Key=mkey, UploadId=upload_id, PartNumber=n, Body=data)
         parts.append({"ETag": up["ETag"], "PartNumber": n})
-    s3.complete_multipart_upload(
+    done = s3.complete_multipart_upload(
         Bucket=bucket, Key=mkey, UploadId=upload_id, MultipartUpload={"Parts": parts}
     )
     combined = s3.get_object(Bucket=bucket, Key=mkey)["Body"].read()
     assert combined == part1 + part2, "multipart result mismatch"
+
+    # The multipart ETag is AWS-style (`<md5-of-part-md5s>-<part-count>`) and stays
+    # consistent across complete / GET / HEAD.
+    mp_etag = done["ETag"].strip('"')
+    assert mp_etag.endswith("-2"), f"multipart ETag must carry the part count: {mp_etag!r}"
+    get_etag = s3.get_object(Bucket=bucket, Key=mkey)["ETag"].strip('"')
+    head_etag = s3.head_object(Bucket=bucket, Key=mkey)["ETag"].strip('"')
+    assert mp_etag == get_etag == head_etag, f"multipart ETag mismatch: {mp_etag} {get_etag} {head_etag}"
 
     # Presigned GET works without ambient credentials on the URL holder's behalf.
     url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": "hello.txt"})

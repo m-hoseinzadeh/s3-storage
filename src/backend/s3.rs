@@ -22,7 +22,7 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 use futures::TryStreamExt;
@@ -177,11 +177,14 @@ impl S3 for FileSystem {
                 let _ = try_!(fs::copy(src_metadata_path, dst_metadata_path).await);
             }
 
-            // Carry over the checksum sidecar so the copy reports the same checksums.
-            let src_info_path = self.get_internal_info_path(bucket, key)?;
-            if src_info_path.exists() {
-                let dst_info_path = self.get_internal_info_path(&input.bucket, &input.key)?;
-                let _ = try_!(fs::copy(src_info_path, dst_info_path).await);
+            // Carry over the checksum sidecar so the copy reports the same checksums,
+            // but drop any stored multipart ETag: the copy is a fresh object whose
+            // ETag is its own MD5, not the source's `<...>-<n>` value.
+            if let Some(mut info) = self.load_internal_info(bucket, key).await? {
+                info.remove("etag");
+                if !info.is_empty() {
+                    self.save_internal_info(&input.bucket, &input.key, &info).await?;
+                }
             }
         }
 
@@ -287,7 +290,15 @@ impl S3 for FileSystem {
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
         let file_len = file_metadata.len();
 
-        let md5_sum = self.get_md5_sum(&input.bucket, &input.key).await?;
+        // The ETag is the stored multipart ETag (`<md5-of-part-md5s>-<n>`) when
+        // present, otherwise the whole-object MD5. Loading the sidecar up front also
+        // avoids hashing a (possibly huge) multipart object just to answer a
+        // conditional request.
+        let info = self.load_internal_info(&input.bucket, &input.key).await?;
+        let etag = match info.as_ref().and_then(|i| i.get("etag")).and_then(|v| v.as_str()) {
+            Some(e) => e.to_owned(),
+            None => self.get_md5_sum(&input.bucket, &input.key).await?,
+        };
 
         // Honour conditional-request headers before streaming any bytes.
         match evaluate_preconditions(
@@ -295,7 +306,7 @@ impl S3 for FileSystem {
             input.if_none_match.as_ref(),
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
-            &md5_sum,
+            &etag,
             &last_modified,
         )? {
             Precondition::NotModified => return Err(s3_error!(NotModified)),
@@ -329,7 +340,6 @@ impl S3 for FileSystem {
 
         let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
 
-        let info = self.load_internal_info(&input.bucket, &input.key).await?;
         let checksum = match &info {
             // S3 skips returning the checksum if a range is specified that is
             // less than the whole file
@@ -351,7 +361,7 @@ impl S3 for FileSystem {
             cache_control: obj_attrs.as_ref().and_then(|a| a.cache_control.clone()),
             expires: obj_attrs.as_ref().and_then(|a| a.get_expires_timestamp()),
             website_redirect_location: obj_attrs.as_ref().and_then(|a| a.website_redirect_location.clone()),
-            e_tag: Some(ETag::Strong(md5_sum)),
+            e_tag: Some(ETag::Strong(etag)),
             checksum_crc32: checksum.checksum_crc32,
             checksum_crc32c: checksum.checksum_crc32c,
             checksum_sha1: checksum.checksum_sha1,
@@ -387,29 +397,21 @@ impl S3 for FileSystem {
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
         let file_len = file_metadata.len();
 
-        // Computing the ETag means hashing the whole file, so only pay that cost when
-        // a conditional header actually needs it; a plain HEAD stays metadata-only.
-        let has_conditional = input.if_match.is_some()
-            || input.if_none_match.is_some()
-            || input.if_modified_since.is_some()
-            || input.if_unmodified_since.is_some();
-        let etag = if has_conditional {
-            let md5_sum = self.get_md5_sum(&input.bucket, &input.key).await?;
-            match evaluate_preconditions(
-                input.if_match.as_ref(),
-                input.if_none_match.as_ref(),
-                input.if_modified_since.as_ref(),
-                input.if_unmodified_since.as_ref(),
-                &md5_sum,
-                &last_modified,
-            )? {
-                Precondition::NotModified => return Err(s3_error!(NotModified)),
-                Precondition::Proceed => {}
-            }
-            Some(ETag::Strong(md5_sum))
-        } else {
-            None
-        };
+        // S3 returns the ETag on HEAD, so always resolve it (stored multipart ETag or
+        // whole-object MD5) and use it for any conditional headers too.
+        let etag_str = self.object_etag(&input.bucket, &input.key).await?;
+        match evaluate_preconditions(
+            input.if_match.as_ref(),
+            input.if_none_match.as_ref(),
+            input.if_modified_since.as_ref(),
+            input.if_unmodified_since.as_ref(),
+            &etag_str,
+            &last_modified,
+        )? {
+            Precondition::NotModified => return Err(s3_error!(NotModified)),
+            Precondition::Proceed => {}
+        }
+        let etag = Some(ETag::Strong(etag_str));
 
         let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
 
@@ -1024,6 +1026,9 @@ impl S3 for FileSystem {
         let parts: Vec<_> = multipart_upload.parts.into_iter().flatten().collect();
         let total_parts_cnt = parts.len();
         let mut last_part_number: i32 = 0;
+        // Concatenated binary MD5 of each part, hashed at the end to form the
+        // AWS-style multipart ETag (`<md5-of-part-md5s>-<part-count>`).
+        let mut part_md5s: Vec<u8> = Vec::with_capacity(total_parts_cnt * 16);
 
         for (idx, part) in parts.into_iter().enumerate() {
             let part_number = part
@@ -1038,8 +1043,21 @@ impl S3 for FileSystem {
 
             let part_path = self.resolve_upload_part_path(upload_id, part_number)?;
 
+            // Stream the part into the assembled object while hashing it in one pass.
             let mut reader = try_!(fs::File::open(&part_path).await);
-            let size = try_!(tokio::io::copy(&mut reader, &mut file_writer.writer()).await);
+            let mut part_md5 = Md5::new();
+            let mut buf = vec![0u8; 65536];
+            let mut size: u64 = 0;
+            loop {
+                let n = try_!(reader.read(&mut buf).await);
+                if n == 0 {
+                    break;
+                }
+                part_md5.update(&buf[..n]);
+                try_!(file_writer.writer().write_all(&buf[..n]).await);
+                size += n as u64;
+            }
+            part_md5s.extend_from_slice(part_md5.finalize().as_ref());
 
             // Every part except the last one listed must be at least 5 MiB.
             let is_last = idx + 1 == total_parts_cnt;
@@ -1050,12 +1068,24 @@ impl S3 for FileSystem {
             debug!(from = %part_path.display(), tmp = %file_writer.tmp_path().display(), to = %file_writer.dest_path().display(), ?size, "write file");
             try_!(fs::remove_file(&part_path).await);
         }
+        // Flush the buffered writer before the atomic rename, or the final part's
+        // tail can be lost (unlike `tokio::io::copy`, manual writes don't auto-flush).
+        try_!(file_writer.writer().flush().await);
         file_writer.done().await?;
 
-        let file_size = try_!(fs::metadata(&object_path).await).len();
-        let md5_sum = self.get_md5_sum(&bucket, &key).await?;
+        // AWS computes the multipart ETag as MD5 of the concatenated part MD5s,
+        // suffixed with the part count. Persist it so GET/HEAD report the same value
+        // (it cannot be recomputed from the assembled bytes alone).
+        let mut composite = Md5::new();
+        composite.update(&part_md5s);
+        let etag = format!("{}-{}", hex(composite.finalize()), total_parts_cnt);
 
-        debug!(?md5_sum, path = %object_path.display(), size = ?file_size, "file md5 sum");
+        let mut info: InternalInfo = default();
+        info.insert("etag".to_owned(), serde_json::Value::String(etag.clone()));
+        self.save_internal_info(&bucket, &key, &info).await?;
+
+        let file_size = try_!(fs::metadata(&object_path).await).len();
+        debug!(?etag, path = %object_path.display(), size = ?file_size, "multipart complete");
 
         let output = CompleteMultipartUploadOutput {
             // TODO: better example of AWS-like keep-alive behavior
@@ -1063,7 +1093,7 @@ impl S3 for FileSystem {
                 Ok(CompleteMultipartUploadOutput {
                     bucket: Some(bucket),
                     key: Some(key),
-                    e_tag: Some(ETag::Strong(md5_sum)),
+                    e_tag: Some(ETag::Strong(etag)),
                     ..Default::default()
                 })
             })),
@@ -1116,6 +1146,17 @@ impl S3 for FileSystem {
 }
 
 impl FileSystem {
+    /// The ETag to advertise for an object: the stored multipart ETag
+    /// (`<md5-of-part-md5s>-<n>`) when present, otherwise the whole-object MD5.
+    async fn object_etag(&self, bucket: &str, key: &str) -> S3Result<String> {
+        if let Some(info) = self.load_internal_info(bucket, key).await?
+            && let Some(etag) = info.get("etag").and_then(|v| v.as_str())
+        {
+            return Ok(etag.to_owned());
+        }
+        Ok(self.get_md5_sum(bucket, key).await?)
+    }
+
     async fn list_objects_recursive(&self, bucket_root: &Path, prefix: &str, objects: &mut Vec<Object>) -> S3Result<()> {
         let mut dir_queue: VecDeque<PathBuf> = default();
         dir_queue.push_back(bucket_root.to_owned());
