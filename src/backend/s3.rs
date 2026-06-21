@@ -1236,6 +1236,22 @@ impl FileSystem {
                 }
 
                 if file_type.is_dir() {
+                    // An explicitly created folder (even an empty one) should appear
+                    // as a common prefix, not only folders inferred from the files
+                    // inside them. Derive it from the directory itself for the
+                    // path-separator delimiter (other delimiters don't map to the
+                    // on-disk directory structure).
+                    if delimiter == "/" {
+                        let folder = format!("{key_str}{delimiter}");
+                        if let Some(rest) = folder.strip_prefix(prefix)
+                            && let Some(pos) = rest.find(delimiter)
+                        {
+                            let mut cp = String::with_capacity(prefix.len() + pos + delimiter.len());
+                            cp.push_str(prefix);
+                            cp.push_str(&rest[..pos + delimiter.len()]);
+                            common_prefixes.insert(cp);
+                        }
+                    }
                     // Continue scanning this directory
                     dir_queue.push_back(entry_path);
                 } else {

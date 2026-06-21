@@ -332,6 +332,23 @@ async fn list_objects_v2_paginates_with_continuation_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_folder_appears_as_common_prefix() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    request(a, "PUT", &host, "/folders", None);
+    // An explicitly created, empty folder (PutObject with a trailing slash).
+    assert_eq!(request(a, "PUT", &host, "/folders/empty/", None).status, 200);
+    assert!(srv.root.join("folders/empty").is_dir(), "trailing-slash PUT creates a directory");
+
+    // A delimited listing must surface the empty folder as a common prefix.
+    let list = get(a, "/folders?list-type=2&delimiter=/");
+    assert_eq!(list.status, 200);
+    let xml = String::from_utf8_lossy(&list.body);
+    assert!(xml.contains("<Prefix>empty/</Prefix>"), "empty folder must appear as a common prefix: {xml}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conditional_get_headers() {
     let srv = spawn(false, vec![], vec![]).await;
     let a = srv.addr;
