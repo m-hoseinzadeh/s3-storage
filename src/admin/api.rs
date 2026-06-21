@@ -247,6 +247,16 @@ async fn create_bucket(state: &AdminState, body: Body) -> Result<S3Response<Body
     if b.name.trim().is_empty() {
         return Err(ApiError::bad_request("bucket name is required"));
     }
+    // The S3 ports validate bucket names during request parsing, but the admin
+    // panel calls the backend directly, so enforce the same AWS naming rules here.
+    // Otherwise an invalid name (path separators, leading dot, etc.) could create a
+    // directory that no S3 client can ever address.
+    if !s3s::path::check_bucket_name(&b.name) {
+        return Err(ApiError::bad_request(
+            "invalid bucket name (3-63 chars: lowercase letters, digits, '.', '-'; \
+             must start and end alphanumeric, no '..', not an IP)",
+        ));
+    }
     let input = CreateBucketInput { bucket: b.name.clone(), ..Default::default() };
     state.fs.create_bucket(state.s3_request(input)).await?;
     Ok(json_ok(serde_json::json!({ "ok": true, "name": b.name })))
