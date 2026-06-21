@@ -124,8 +124,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn dechunk(mut body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = find(body, b"\r\n") else { break };
+    while let Some(pos) = find(body, b"\r\n") {
         let size_str = std::str::from_utf8(&body[..pos]).unwrap();
         let size = usize::from_str_radix(size_str.split(';').next().unwrap().trim(), 16).unwrap();
         body = &body[pos + 2..];
