@@ -877,28 +877,29 @@ impl S3 for FileSystem {
         let object_path = self.get_object_path(&bucket, &key)?;
         let mut file_writer = self.prepare_file_write(&object_path).await?;
 
-        let mut cnt: i32 = 0;
-        let total_parts_cnt = multipart_upload
-            .parts
-            .as_ref()
-            .map(|parts| i32::try_from(parts.len()).expect("total number of parts must be <= 10000."))
-            .unwrap_or_default();
+        let parts: Vec<_> = multipart_upload.parts.into_iter().flatten().collect();
+        let total_parts_cnt = parts.len();
+        let mut last_part_number: i32 = 0;
 
-        for part in multipart_upload.parts.into_iter().flatten() {
+        for (idx, part) in parts.into_iter().enumerate() {
             let part_number = part
                 .part_number
                 .ok_or_else(|| s3_error!(InvalidRequest, "missing part number"))?;
-            cnt += 1;
-            if part_number != cnt {
-                return Err(s3_error!(InvalidRequest, "invalid part order"));
+            // Parts must be listed in ascending part-number order, but need not be
+            // contiguous (AWS allows gaps, e.g. 1, 3, 5).
+            if part_number <= last_part_number {
+                return Err(s3_error!(InvalidPartOrder));
             }
+            last_part_number = part_number;
 
             let part_path = self.resolve_upload_part_path(upload_id, part_number)?;
 
             let mut reader = try_!(fs::File::open(&part_path).await);
             let size = try_!(tokio::io::copy(&mut reader, &mut file_writer.writer()).await);
 
-            if part_number != total_parts_cnt && size < 5 * 1024 * 1024 {
+            // Every part except the last one listed must be at least 5 MiB.
+            let is_last = idx + 1 == total_parts_cnt;
+            if !is_last && size < 5 * 1024 * 1024 {
                 return Err(s3_error!(EntityTooSmall));
             }
 
