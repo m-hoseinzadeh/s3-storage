@@ -1236,12 +1236,13 @@ impl FileSystem {
                 }
 
                 if file_type.is_dir() {
-                    // An explicitly created folder (even an empty one) should appear
-                    // as a common prefix, not only folders inferred from the files
-                    // inside them. Derive it from the directory itself for the
-                    // path-separator delimiter (other delimiters don't map to the
-                    // on-disk directory structure).
                     if delimiter == "/" {
+                        // For the path-separator delimiter the on-disk tree maps
+                        // directly onto key prefixes. A directory below the delimiter
+                        // boundary collapses entirely into a single common prefix
+                        // (covering any explicitly created empty folder too), so record
+                        // it and skip descending — that prunes the whole subtree from
+                        // the walk instead of reading every nested file.
                         let folder = format!("{key_str}{delimiter}");
                         if let Some(rest) = folder.strip_prefix(prefix)
                             && let Some(pos) = rest.find(delimiter)
@@ -1250,10 +1251,16 @@ impl FileSystem {
                             cp.push_str(prefix);
                             cp.push_str(&rest[..pos + delimiter.len()]);
                             common_prefixes.insert(cp);
+                        } else {
+                            // The prefix directory itself or an ancestor of it: descend
+                            // to reach the entries at the listing level.
+                            dir_queue.push_back(entry_path);
                         }
+                    } else {
+                        // Other delimiters don't map to the directory structure, so we
+                        // still have to walk every file and group by the delimiter.
+                        dir_queue.push_back(entry_path);
                     }
-                    // Continue scanning this directory
-                    dir_queue.push_back(entry_path);
                 } else {
                     // For files, determine if they should be listed directly or as common prefixes
                     let remaining = &key_str[prefix.len()..];

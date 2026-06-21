@@ -332,6 +332,32 @@ async fn list_objects_v2_paginates_with_continuation_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delimited_listing_groups_nested_trees() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    request(a, "PUT", &host, "/tree", None);
+    for key in ["top.txt", "a/1.txt", "a/deep/2.txt", "a/deep/deeper/3.txt", "b/4.txt"] {
+        request(a, "PUT", &host, &format!("/tree/{key}"), Some(b"x"));
+    }
+
+    // Root listing with "/" collapses each nested subtree into one prefix and lists
+    // only the top-level file (the deep files are never returned as keys).
+    let root = get(a, "/tree?list-type=2&delimiter=/");
+    let xml = String::from_utf8_lossy(&root.body);
+    assert!(xml.contains("<Key>top.txt</Key>"), "{xml}");
+    assert!(xml.contains("<Prefix>a/</Prefix>") && xml.contains("<Prefix>b/</Prefix>"), "{xml}");
+    assert!(!xml.contains("deep/2.txt") && !xml.contains("deeper/3.txt"), "delimited listing must not recurse: {xml}");
+
+    // A non-path delimiter still groups correctly (it walks all keys, not the dirs).
+    request(a, "PUT", &host, "/tree/x-one", Some(b"x"));
+    request(a, "PUT", &host, "/tree/x-two", Some(b"x"));
+    let dash = get(a, "/tree?list-type=2&delimiter=-");
+    let dxml = String::from_utf8_lossy(&dash.body);
+    assert!(dxml.contains("<Prefix>x-</Prefix>"), "non-path delimiter must still group: {dxml}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_folder_appears_as_common_prefix() {
     let srv = spawn(false, vec![], vec![]).await;
     let a = srv.addr;
