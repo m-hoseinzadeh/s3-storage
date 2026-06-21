@@ -138,11 +138,18 @@ fn dechunk(mut body: &[u8]) -> Vec<u8> {
 }
 
 fn request(addr: SocketAddr, method: &str, host: &str, path: &str, body: Option<&[u8]>) -> Resp {
+    request_h(addr, method, host, path, &[], body)
+}
+
+fn request_h(addr: SocketAddr, method: &str, host: &str, path: &str, extra: &[(&str, &str)], body: Option<&[u8]>) -> Resp {
     let mut stream = TcpStream::connect(addr).unwrap();
     // Safety net so a protocol mishap fails the test instead of hanging it.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
 
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
     if let Some(b) = body {
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
@@ -322,6 +329,49 @@ async fn list_objects_v2_paginates_with_continuation_token() {
         next = xml[s..e].to_owned();
     }
     assert_eq!(seen, vec!["k1", "k2", "k3", "k4", "k5"], "pagination must enumerate every key exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditional_get_headers() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    request(a, "PUT", &host, "/cond", None);
+    request(a, "PUT", &host, "/cond/file.txt", Some(b"conditional body"));
+
+    // Learn the object's ETag from a plain GET.
+    let base = get(a, "/cond/file.txt");
+    assert_eq!(base.status, 200);
+    let etag = base.header("etag").expect("GET must return an ETag").to_owned();
+
+    // If-None-Match with the current ETag => 304 Not Modified, no body.
+    let inm_hit = request_h(a, "GET", &host, "/cond/file.txt", &[("If-None-Match", &etag)], None);
+    assert_eq!(inm_hit.status, 304, "matching If-None-Match must be 304");
+
+    // If-None-Match with a different ETag => 200 with the body.
+    let inm_miss = request_h(a, "GET", &host, "/cond/file.txt", &[("If-None-Match", "\"deadbeef\"")], None);
+    assert_eq!(inm_miss.status, 200);
+    assert_eq!(inm_miss.body, b"conditional body");
+
+    // If-Match with a different ETag => 412 Precondition Failed.
+    let im_miss = request_h(a, "GET", &host, "/cond/file.txt", &[("If-Match", "\"deadbeef\"")], None);
+    assert_eq!(im_miss.status, 412, "non-matching If-Match must be 412");
+
+    // If-Match with the current ETag => 200.
+    let im_hit = request_h(a, "GET", &host, "/cond/file.txt", &[("If-Match", &etag)], None);
+    assert_eq!(im_hit.status, 200);
+    assert_eq!(im_hit.body, b"conditional body");
+
+    // A far-future If-Modified-Since means "not modified" => 304.
+    let ims = request_h(
+        a,
+        "GET",
+        &host,
+        "/cond/file.txt",
+        &[("If-Modified-Since", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        None,
+    );
+    assert_eq!(ims.status, 304, "future If-Modified-Since must be 304");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

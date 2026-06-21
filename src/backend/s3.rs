@@ -57,6 +57,68 @@ fn fmt_content_range(start: u64, end_inclusive: u64, size: u64) -> String {
     format!("bytes {start}-{end_inclusive}/{size}")
 }
 
+/// Outcome of evaluating conditional-request headers.
+enum Precondition {
+    /// Serve the object normally.
+    Proceed,
+    /// The client's cached copy is still fresh (HTTP 304).
+    NotModified,
+}
+
+/// Whether an `If-Match` / `If-None-Match` condition matches the object's `etag`.
+/// `*` matches any existing object; otherwise the (strong or weak) tag value is
+/// compared against the bare ETag.
+fn cond_matches(cond: &ETagCondition, etag: &str) -> bool {
+    match cond {
+        ETagCondition::Any => true,
+        ETagCondition::ETag(tag) => {
+            let value = tag.as_strong().or_else(|| tag.as_weak()).unwrap_or_default();
+            value == etag.trim_matches('"')
+        }
+    }
+}
+
+/// Whole-second epoch value, so comparisons match the one-second resolution of
+/// HTTP dates (the `Last-Modified` we advertise is truncated to seconds).
+fn ts_secs(ts: &Timestamp) -> i64 {
+    time::OffsetDateTime::from(ts.clone()).unix_timestamp()
+}
+
+/// Evaluate S3 conditional GET/HEAD headers against the object's current
+/// `etag`/`last_modified`. `If-Match` takes precedence over `If-Unmodified-Since`
+/// for the 412 path, and `If-None-Match` over `If-Modified-Since` for the 304 path,
+/// matching the AWS S3 evaluation order.
+fn evaluate_preconditions(
+    if_match: Option<&ETagCondition>,
+    if_none_match: Option<&ETagCondition>,
+    if_modified_since: Option<&Timestamp>,
+    if_unmodified_since: Option<&Timestamp>,
+    etag: &str,
+    last_modified: &Timestamp,
+) -> S3Result<Precondition> {
+    if let Some(im) = if_match {
+        if !cond_matches(im, etag) {
+            return Err(s3_error!(PreconditionFailed));
+        }
+    } else if let Some(ius) = if_unmodified_since
+        && ts_secs(last_modified) > ts_secs(ius)
+    {
+        return Err(s3_error!(PreconditionFailed));
+    }
+
+    if let Some(inm) = if_none_match {
+        if cond_matches(inm, etag) {
+            return Ok(Precondition::NotModified);
+        }
+    } else if let Some(ims) = if_modified_since
+        && ts_secs(last_modified) <= ts_secs(ims)
+    {
+        return Ok(Precondition::NotModified);
+    }
+
+    Ok(Precondition::Proceed)
+}
+
 #[async_trait::async_trait]
 impl S3 for FileSystem {
     #[tracing::instrument]
@@ -225,6 +287,21 @@ impl S3 for FileSystem {
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
         let file_len = file_metadata.len();
 
+        let md5_sum = self.get_md5_sum(&input.bucket, &input.key).await?;
+
+        // Honour conditional-request headers before streaming any bytes.
+        match evaluate_preconditions(
+            input.if_match.as_ref(),
+            input.if_none_match.as_ref(),
+            input.if_modified_since.as_ref(),
+            input.if_unmodified_since.as_ref(),
+            &md5_sum,
+            &last_modified,
+        )? {
+            Precondition::NotModified => return Err(s3_error!(NotModified)),
+            Precondition::Proceed => {}
+        }
+
         let (content_length, content_range) = match input.range {
             None => (file_len, None),
             Some(range) => {
@@ -251,8 +328,6 @@ impl S3 for FileSystem {
         let body = bytes_stream(ReaderStream::with_capacity(file, 4096), content_length_usize);
 
         let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
-
-        let md5_sum = self.get_md5_sum(&input.bucket, &input.key).await?;
 
         let info = self.load_internal_info(&input.bucket, &input.key).await?;
         let checksum = match &info {
@@ -312,11 +387,36 @@ impl S3 for FileSystem {
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
         let file_len = file_metadata.len();
 
+        // Computing the ETag means hashing the whole file, so only pay that cost when
+        // a conditional header actually needs it; a plain HEAD stays metadata-only.
+        let has_conditional = input.if_match.is_some()
+            || input.if_none_match.is_some()
+            || input.if_modified_since.is_some()
+            || input.if_unmodified_since.is_some();
+        let etag = if has_conditional {
+            let md5_sum = self.get_md5_sum(&input.bucket, &input.key).await?;
+            match evaluate_preconditions(
+                input.if_match.as_ref(),
+                input.if_none_match.as_ref(),
+                input.if_modified_since.as_ref(),
+                input.if_unmodified_since.as_ref(),
+                &md5_sum,
+                &last_modified,
+            )? {
+                Precondition::NotModified => return Err(s3_error!(NotModified)),
+                Precondition::Proceed => {}
+            }
+            Some(ETag::Strong(md5_sum))
+        } else {
+            None
+        };
+
         let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
 
         #[allow(clippy::redundant_closure_for_method_calls)]
         let output = HeadObjectOutput {
             content_length: Some(try_!(i64::try_from(file_len))),
+            e_tag: etag,
             content_type: obj_attrs.as_ref().and_then(|a| a.content_type.clone()),
             content_encoding: obj_attrs.as_ref().and_then(|a| a.content_encoding.clone()),
             content_disposition: obj_attrs.as_ref().and_then(|a| a.content_disposition.clone()),
