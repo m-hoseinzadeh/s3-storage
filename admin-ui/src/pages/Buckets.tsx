@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Database, Plus, Trash2, FolderOpen, Globe, Lock } from "lucide-react";
+import { Database, Plus, Trash2, FolderOpen, Globe, Lock, Settings } from "lucide-react";
 import { api, ApiError, type BucketInfo } from "../lib/api";
 import { formatDate } from "../lib/format";
 import { Badge, Button, Card, ConfirmModal, EmptyState, Field, Input, Modal, Spinner, useToast } from "../components/ui";
+import { BucketSettingsModal } from "../components/BucketSettingsModal";
 import { PageHeader, TutList } from "../components/PageHeader";
 
 export function Buckets() {
@@ -13,6 +14,7 @@ export function Buckets() {
   const [busy, setBusy] = useState(false);
   const [toDelete, setToDelete] = useState<string | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [settingsFor, setSettingsFor] = useState<BucketInfo | null>(null);
   const toast = useToast();
 
   const load = useCallback(() => {
@@ -82,6 +84,7 @@ export function Buckets() {
             items={[
               "Click New bucket and enter a DNS-style name (lowercase letters, numbers, hyphens).",
               "Click the public/private badge on a bucket to toggle anonymous GET/HEAD access.",
+              "Click the gear button to set a bucket's public access and the custom domains pointing at it.",
               "Open a bucket to manage its objects in the Object Browser.",
               "Deleting a bucket removes it and all objects inside — this cannot be undone.",
             ]}
@@ -147,6 +150,9 @@ export function Buckets() {
                     <FolderOpen className="h-4 w-4" /> Open
                   </Button>
                 </Link>
+                <Button variant="ghost" size="icon" aria-label={`Settings for ${b.name}`} onClick={() => setSettingsFor(b)}>
+                  <Settings className="h-4 w-4" />
+                </Button>
                 <Button variant="ghost" size="icon" aria-label={`Delete ${b.name}`} onClick={() => setToDelete(b.name)}>
                   <Trash2 className="h-4 w-4 text-[var(--color-danger)]" />
                 </Button>
@@ -176,6 +182,15 @@ export function Buckets() {
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-bucket" autoFocus onKeyDown={(e) => e.key === "Enter" && name.trim() && create()} />
         </Field>
       </Modal>
+
+      <BucketSettingsModal
+        bucket={settingsFor}
+        onClose={() => setSettingsFor(null)}
+        onSaved={() => {
+          setSettingsFor(null);
+          load();
+        }}
+      />
 
       <ConfirmModal
         open={toDelete !== null}

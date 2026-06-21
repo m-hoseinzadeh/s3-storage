@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Server, Globe, Link2, KeyRound, Info, BookOpen, Save } from "lucide-react";
+import { Server, Link2, KeyRound, Info, BookOpen, Save } from "lucide-react";
 import { api, ApiError, type ServerConfig } from "../lib/api";
 import { Button, Card, Field, Input, Spinner, useToast } from "../components/ui";
 import { PageHeader, TutList } from "../components/PageHeader";
@@ -12,9 +12,7 @@ const toLines = (s: string) =>
 
 export function Settings() {
   const [config, setConfig] = useState<ServerConfig | null>(null);
-  const [publicBuckets, setPublicBuckets] = useState("");
   const [domains, setDomains] = useState("");
-  const [domainMap, setDomainMap] = useState("");
   const [apiUrl, setApiUrl] = useState("");
   const [ttl, setTtl] = useState("");
   const [saving, setSaving] = useState(false);
@@ -22,9 +20,7 @@ export function Settings() {
 
   const apply = useCallback((c: ServerConfig) => {
     setConfig(c);
-    setPublicBuckets(c.public_buckets.join("\n"));
     setDomains(c.domains.join("\n"));
-    setDomainMap(c.domain_map.join("\n"));
     setApiUrl(c.api_public_url ?? "");
     setTtl(c.admin_session_ttl_secs != null ? String(c.admin_session_ttl_secs) : "");
   }, []);
@@ -46,9 +42,7 @@ export function Settings() {
         throw new ApiError(400, "BadRequest", "Session TTL must be a positive number of seconds");
       }
       await api.updateSettings({
-        public_buckets: toLines(publicBuckets),
         domains: toLines(domains),
-        domain_map: toLines(domainMap),
         api_public_url: apiUrl.trim(),
         admin_session_ttl_secs: ttlNum,
       });
@@ -70,8 +64,8 @@ export function Settings() {
           <TutList
             items={[
               "These settings are stored in the server's database and can be changed here — no restart needed.",
-              "Public buckets allow anonymous GET/HEAD on the public port; everything else requires credentials or a presigned URL.",
-              "Virtual-host domains enable <bucket>.<domain> addressing; the custom domain map points a host straight at a bucket.",
+              "Virtual-host base domains enable <bucket>.<domain> addressing across all buckets.",
+              "Public access and a bucket's own custom domains are set per bucket — use the gear button on the Buckets page.",
               "Bind address, ports and credentials are still set via S3_* flags / environment variables at startup.",
             ]}
           />
@@ -97,27 +91,10 @@ export function Settings() {
           </Card>
 
           <Card className="p-5">
-            <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold">
-              <Globe className="h-4 w-4 text-[var(--color-accent)]" /> Public buckets
-            </h3>
-            <Field label="One bucket name per line" hint="Listed buckets allow anonymous GET/HEAD on the public port.">
-              <TextArea value={publicBuckets} onChange={setPublicBuckets} placeholder={"assets\nuploads"} rows={5} />
-            </Field>
-          </Card>
-
-          <Card className="p-5">
             <h3 className="mb-3 text-sm font-semibold">Domains</h3>
-            <Field label="Virtual-host base domains" hint="One per line, e.g. cdn.example.com — enables <bucket>.<domain>.">
+            <Field label="Virtual-host base domains" hint="One per line, e.g. cdn.example.com — enables <bucket>.<domain>. Per-bucket custom domains are set from the Buckets page.">
               <TextArea value={domains} onChange={setDomains} placeholder={"cdn.example.com"} rows={4} />
             </Field>
-            <div className="mt-4">
-              <Field
-                label="Custom domain map"
-                hint="One host=bucket per line, e.g. files.example.com=assets — points a host straight at a bucket."
-              >
-                <TextArea value={domainMap} onChange={setDomainMap} placeholder={"files.example.com=assets"} rows={4} />
-              </Field>
-            </div>
           </Card>
 
           <Card className="p-5">
