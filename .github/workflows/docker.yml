@@ -27,6 +27,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so `git describe` can produce a meaningful version.
+          fetch-depth: 0
+
+      - name: Compute app version
+        id: version
+        # Nearest tag + commits-since + short sha (e.g. v0.1.0-3-gabc1234), or just
+        # the short sha when no tags exist. Stamped into the admin UI on each push.
+        run: echo "value=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -58,6 +67,8 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.value }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

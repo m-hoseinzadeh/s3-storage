@@ -69,6 +69,9 @@ export function Layout() {
             <LogOut className="h-4 w-4" />
             Sign out
           </Button>
+          <div className="mono mt-2 px-2 text-center text-[11px] text-[var(--color-faint-fg)]">
+            v{__APP_VERSION__}
+          </div>
         </div>
       </aside>
 

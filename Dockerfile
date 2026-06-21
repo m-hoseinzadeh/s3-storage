@@ -3,6 +3,9 @@
 # rust-embed at compile time, so it must exist before the Rust build.
 FROM node:22-slim AS ui
 WORKDIR /ui
+# App version stamped into the UI bundle (set by CI on each push; "dev" otherwise).
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 COPY admin-ui/package.json admin-ui/package-lock.json* ./
 RUN npm install
 COPY admin-ui/ ./

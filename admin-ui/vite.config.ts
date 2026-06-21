@@ -6,6 +6,10 @@ import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
   base: "/",
   plugins: [react(), tailwindcss()],
+  // Injected at build time (set by CI / Docker on each push); "dev" locally.
+  define: {
+    __APP_VERSION__: JSON.stringify(process.env.APP_VERSION || "dev"),
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
