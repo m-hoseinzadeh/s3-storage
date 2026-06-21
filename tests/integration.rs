@@ -15,7 +15,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use s3_storage::{
-    Config, SettingsStore, SettingsUpdate, SharedSettings, build_api_service, build_public_service, open_backend, serve,
+    Config, CorsService, SettingsStore, SettingsUpdate, SharedSettings, build_api_service, build_public_service,
+    open_backend, serve,
 };
 use s3s::service::S3Service;
 
@@ -101,6 +102,35 @@ async fn spawn_public(public_buckets: Vec<String>, domain_map: Vec<String>) -> T
     let settings = seed_settings(&root, public_buckets, domain_map);
     let service = build_public_service(&config, open_backend(&config).unwrap(), &settings);
     serve_on(root, settings, service).await
+}
+
+/// Spawn the **public** service wrapped in the [`CorsService`] layer, exactly as
+/// `run()` installs it, with the given allowed-origins list configured.
+async fn spawn_public_cors(public_buckets: Vec<String>, allowed_origins: Vec<String>) -> TestServer {
+    use std::sync::Arc;
+    let root = unique_dir();
+    let config = test_config(root.clone(), true);
+    let settings = SettingsStore::open(&root).unwrap();
+    settings
+        .update(&SettingsUpdate {
+            public_buckets: Some(public_buckets),
+            allowed_origins: Some(allowed_origins),
+            ..Default::default()
+        })
+        .unwrap();
+    let inner = build_public_service(&config, open_backend(&config).unwrap(), &settings);
+    let service = CorsService::new(inner, Arc::clone(&settings));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = serve(service, listener, async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    TestServer { addr, root, settings, _shutdown: tx }
 }
 
 struct Resp {
@@ -562,4 +592,99 @@ async fn custom_domain_routes_to_bucket() {
     let resp = request(a, "GET", "files.example.com", "/index.html", None);
     assert_eq!(resp.status, 200, "custom domain should route to bucket");
     assert_eq!(resp.body, b"<html>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_echoes_allowed_origin_on_public_read() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["https://app.example.com".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    // Allowed origin: the object is served and the response carries the matching
+    // Access-Control-Allow-Origin plus `Vary: Origin`.
+    let allowed = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://app.example.com")], None);
+    assert_eq!(allowed.status, 200);
+    assert_eq!(allowed.body, b"FONT");
+    assert_eq!(allowed.header("access-control-allow-origin"), Some("https://app.example.com"));
+    assert_eq!(allowed.header("vary"), Some("Origin"));
+
+    // Disallowed origin: still served (it's a public object), but no CORS header,
+    // so the browser discards the font.
+    let other = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://evil.example.com")], None);
+    assert_eq!(other.status, 200);
+    assert_eq!(other.header("access-control-allow-origin"), None);
+
+    // No Origin header (e.g. the AWS CLI / curl): plain response, no CORS header.
+    let no_origin = get(a, "/assets/font.woff2");
+    assert_eq!(no_origin.status, 200);
+    assert_eq!(no_origin.header("access-control-allow-origin"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_wildcard_allows_any_origin() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["*".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let resp = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://anything.example")], None);
+    assert_eq!(resp.status, 200);
+    // Wildcard echoes `*` and omits `Vary` (the value is not origin-specific).
+    assert_eq!(resp.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(resp.header("vary"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_preflight_options_answered_without_backend() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["https://app.example.com".to_owned()]).await;
+    let a = srv.addr;
+
+    // OPTIONS preflight from an allowed origin: 204 with the CORS preflight headers,
+    // even though the object does not exist and the S3 layer forbids OPTIONS.
+    let pre = request_h(
+        a,
+        "OPTIONS",
+        &a.to_string(),
+        "/assets/font.woff2",
+        &[("Origin", "https://app.example.com"), ("Access-Control-Request-Method", "GET")],
+        None,
+    );
+    assert_eq!(pre.status, 204);
+    assert_eq!(pre.header("access-control-allow-origin"), Some("https://app.example.com"));
+    assert_eq!(pre.header("access-control-allow-methods"), Some("GET, HEAD, OPTIONS"));
+
+    // Preflight from a disallowed origin: still 204, but no CORS headers.
+    let denied = request_h(
+        a,
+        "OPTIONS",
+        &a.to_string(),
+        "/assets/font.woff2",
+        &[("Origin", "https://evil.example.com"), ("Access-Control-Request-Method", "GET")],
+        None,
+    );
+    assert_eq!(denied.status, 204);
+    assert_eq!(denied.header("access-control-allow-origin"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_allowed_origins_update_takes_effect_live() {
+    // Start with no allowed origins, then add one and confirm the live snapshot is used.
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec![]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let before = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://app.example.com")], None);
+    assert_eq!(before.header("access-control-allow-origin"), None);
+
+    srv.settings
+        .update(&SettingsUpdate {
+            allowed_origins: Some(vec!["https://app.example.com".to_owned()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let after = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://app.example.com")], None);
+    assert_eq!(after.header("access-control-allow-origin"), Some("https://app.example.com"));
 }

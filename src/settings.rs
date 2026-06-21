@@ -38,6 +38,10 @@ pub struct RuntimeSettings {
     pub domains: Vec<String>,
     /// Custom-domain mappings as `host=bucket` entries.
     pub domain_map: Vec<String>,
+    /// Origins (`scheme://host[:port]`, or `*` for any) allowed to read from the
+    /// public endpoint cross-origin. Drives the `Access-Control-Allow-Origin` header
+    /// so browsers accept fonts and other CORS-gated subresources served publicly.
+    pub allowed_origins: Vec<String>,
     /// Public base URL of the S3 API, used when minting presigned links.
     /// Normalized so a blank value is `None`.
     pub api_public_url: Option<String>,
@@ -51,6 +55,7 @@ impl Default for RuntimeSettings {
             public_buckets: Vec::new(),
             domains: Vec::new(),
             domain_map: Vec::new(),
+            allowed_origins: Vec::new(),
             api_public_url: None,
             admin_session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
         }
@@ -67,6 +72,8 @@ pub struct SettingsUpdate {
     pub domains: Option<Vec<String>>,
     #[serde(default)]
     pub domain_map: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_origins: Option<Vec<String>>,
     #[serde(default)]
     pub api_public_url: Option<String>,
     #[serde(default)]
@@ -97,6 +104,11 @@ impl SettingsUpdate {
         {
             return Err("domains must not be empty".to_owned());
         }
+        if let Some(origins) = &self.allowed_origins
+            && origins.iter().any(|o| o.trim().is_empty())
+        {
+            return Err("allowed origins must not be empty".to_owned());
+        }
         if self.admin_session_ttl_secs == Some(0) {
             return Err("admin_session_ttl_secs must be greater than 0".to_owned());
         }
@@ -112,6 +124,10 @@ struct Snapshot {
     public_set: HashSet<String>,
     domain_map_parsed: HashMap<String, String>,
     base_domains_lc: Vec<String>,
+    /// Normalized allowed-origin set (wildcard excluded; see `allow_any_origin`).
+    allowed_origins: HashSet<String>,
+    /// True when `*` is configured: any origin is allowed.
+    allow_any_origin: bool,
 }
 
 impl Snapshot {
@@ -119,7 +135,17 @@ impl Snapshot {
         let public_set = settings.public_buckets.iter().cloned().collect();
         let domain_map_parsed = parse_domain_map(&settings.domain_map);
         let base_domains_lc = settings.domains.iter().map(|d| d.to_ascii_lowercase()).collect();
-        Self { settings, public_set, domain_map_parsed, base_domains_lc }
+        let normalized = normalize_origins(&settings.allowed_origins);
+        let allow_any_origin = normalized.iter().any(|o| o == "*");
+        let allowed_origins = normalized.into_iter().filter(|o| o != "*").collect();
+        Self {
+            settings,
+            public_set,
+            domain_map_parsed,
+            base_domains_lc,
+            allowed_origins,
+            allow_any_origin,
+        }
     }
 }
 
@@ -157,6 +183,23 @@ impl SettingsStore {
     #[must_use]
     pub fn is_public(&self, bucket: &str) -> bool {
         self.snapshot.read().unwrap().public_set.contains(bucket)
+    }
+
+    /// Resolve the `Access-Control-Allow-Origin` value to return for a request
+    /// carrying the given `Origin`, or `None` if the allow-list does not permit it.
+    /// Returns `"*"` when a wildcard is configured, otherwise the (normalized)
+    /// matching origin so it can be echoed back.
+    #[must_use]
+    pub fn cors_allow_origin(&self, origin: &str) -> Option<String> {
+        let snap = self.snapshot.read().unwrap();
+        if snap.allow_any_origin {
+            return Some("*".to_owned());
+        }
+        let origin = origin.trim().trim_end_matches('/');
+        if snap.allowed_origins.contains(origin) {
+            return Some(origin.to_owned());
+        }
+        None
     }
 
     /// Resolve a host (without port) to a bucket via custom-domain mapping or
@@ -226,10 +269,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     // so read it back via query_row rather than pragma_update.
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS public_buckets (bucket TEXT PRIMARY KEY);
-         CREATE TABLE IF NOT EXISTS domains        (domain TEXT PRIMARY KEY);
-         CREATE TABLE IF NOT EXISTS domain_map     (host TEXT PRIMARY KEY, bucket TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS settings_kv    (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS public_buckets  (bucket TEXT PRIMARY KEY);
+         CREATE TABLE IF NOT EXISTS domains         (domain TEXT PRIMARY KEY);
+         CREATE TABLE IF NOT EXISTS domain_map      (host TEXT PRIMARY KEY, bucket TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS allowed_origins (origin TEXT PRIMARY KEY);
+         CREATE TABLE IF NOT EXISTS settings_kv     (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     // Future migrations branch on the stored `user_version` before bumping it.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -239,6 +283,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 fn load_settings(conn: &Connection) -> rusqlite::Result<RuntimeSettings> {
     let public_buckets = load_column(conn, "SELECT bucket FROM public_buckets ORDER BY bucket")?;
     let domains = load_column(conn, "SELECT domain FROM domains ORDER BY domain")?;
+    let allowed_origins = load_column(conn, "SELECT origin FROM allowed_origins ORDER BY origin")?;
     let domain_map = {
         let mut stmt = conn.prepare("SELECT host, bucket FROM domain_map ORDER BY host")?;
         let rows = stmt.query_map([], |r| {
@@ -253,7 +298,14 @@ fn load_settings(conn: &Connection) -> rusqlite::Result<RuntimeSettings> {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_SESSION_TTL_SECS);
-    Ok(RuntimeSettings { public_buckets, domains, domain_map, api_public_url, admin_session_ttl_secs })
+    Ok(RuntimeSettings {
+        public_buckets,
+        domains,
+        domain_map,
+        allowed_origins,
+        api_public_url,
+        admin_session_ttl_secs,
+    })
 }
 
 fn apply(tx: &rusqlite::Transaction<'_>, upd: &SettingsUpdate) -> rusqlite::Result<()> {
@@ -267,6 +319,12 @@ fn apply(tx: &rusqlite::Transaction<'_>, upd: &SettingsUpdate) -> rusqlite::Resu
         tx.execute("DELETE FROM domains", [])?;
         for d in normalize_list(domains) {
             tx.execute("INSERT OR IGNORE INTO domains (domain) VALUES (?1)", [&d])?;
+        }
+    }
+    if let Some(origins) = &upd.allowed_origins {
+        tx.execute("DELETE FROM allowed_origins", [])?;
+        for o in normalize_origins(origins) {
+            tx.execute("INSERT OR IGNORE INTO allowed_origins (origin) VALUES (?1)", [&o])?;
         }
     }
     if let Some(entries) = &upd.domain_map {
@@ -318,6 +376,19 @@ fn normalize_list(items: &[String]) -> Vec<String> {
     items
         .iter()
         .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.clone()))
+        .collect()
+}
+
+/// Trim, strip any trailing `/`, drop empties, and dedup origins while preserving
+/// order. Keeping a canonical form (no trailing slash) lets request `Origin` headers
+/// — which never carry a trailing slash — match stored entries reliably.
+fn normalize_origins(items: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .map(|s| s.trim().trim_end_matches('/').to_owned())
         .filter(|s| !s.is_empty())
         .filter(|s| seen.insert(s.clone()))
         .collect()

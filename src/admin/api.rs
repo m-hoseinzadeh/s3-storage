@@ -138,6 +138,7 @@ fn config(state: &AdminState) -> S3Response<Body> {
         "public_buckets": s.public_buckets,
         "domains": s.domains,
         "domain_map": s.domain_map,
+        "allowed_origins": s.allowed_origins,
         "api_public_url": s.api_public_url,
         "admin_session_ttl_secs": s.admin_session_ttl_secs,
         "admin_path": "/",

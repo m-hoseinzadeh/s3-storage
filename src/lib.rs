@@ -9,6 +9,7 @@ mod access;
 mod admin;
 mod backend;
 mod config;
+mod cors;
 mod host;
 mod settings;
 
@@ -17,8 +18,12 @@ use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
+use hyper::body::Incoming;
+use hyper::service::Service;
+use hyper::Request;
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
+use s3s::{HttpError, HttpResponse};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -33,6 +38,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 pub use crate::access::{AccessControl, PublicReadAccess};
 pub use crate::backend::FileSystem;
 pub use crate::config::Config;
+pub use crate::cors::CorsService;
 pub use crate::host::CustomHost;
 pub use crate::settings::{RuntimeSettings, SettingsStore, SettingsUpdate, SharedSettings};
 
@@ -110,11 +116,18 @@ pub fn build_admin_service(config: &Config, fs: Arc<FileSystem>, settings: &Shar
 
 /// Accept connections and serve `service` until `shutdown` resolves, then drain
 /// in-flight connections (up to 10s).
-pub async fn serve(
-    service: S3Service,
+///
+/// Generic over the service so it accepts both a bare [`S3Service`] and the
+/// [`CorsService`]-wrapped public endpoint; both yield an [`HttpResponse`].
+pub async fn serve<S>(
+    service: S,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: Service<Request<Incoming>, Response = HttpResponse, Error = HttpError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
     let http = ConnBuilder::new(TokioExecutor::new());
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -161,7 +174,13 @@ pub async fn run(config: Config) -> io::Result<()> {
     let api_listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     info!("API listening on http://{}", api_listener.local_addr()?);
 
-    let public = build_public_service(&config, Arc::clone(&fs), &settings);
+    // The public endpoint is wrapped in the CORS layer so cross-origin reads
+    // (fonts and other CORS-gated subresources) get the configured
+    // `Access-Control-Allow-Origin` header.
+    let public = CorsService::new(
+        build_public_service(&config, Arc::clone(&fs), &settings),
+        Arc::clone(&settings),
+    );
     let public_listener = TcpListener::bind((config.host.as_str(), config.public_port)).await?;
     info!("public endpoint listening on http://{}", public_listener.local_addr()?);
 

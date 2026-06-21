@@ -110,6 +110,10 @@ These deployment-facing settings live in a SQLite database at
 - **Public buckets** — which buckets allow anonymous `GET`/`HEAD` on the public port.
 - **Domains** — base domains for `<bucket>.<domain>` virtual-hosting.
 - **Custom domain map** — `host=bucket` mappings that point a host straight at a bucket.
+- **Allowed CORS origins** — origins (`scheme://host[:port]`, or `*` for any) allowed
+  to read from the public port cross-origin. Sets `Access-Control-Allow-Origin` (and
+  answers `OPTIONS` preflights) so browsers accept fonts and other CORS-gated
+  subresources; blank means no CORS headers are sent.
 - **Public API URL** — the API's public base URL used to mint presigned links.
 - **Admin session lifetime** — how long a login stays valid (applies to new logins).
 

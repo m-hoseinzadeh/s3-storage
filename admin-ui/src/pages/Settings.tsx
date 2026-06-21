@@ -13,6 +13,7 @@ const toLines = (s: string) =>
 export function Settings() {
   const [config, setConfig] = useState<ServerConfig | null>(null);
   const [domains, setDomains] = useState("");
+  const [allowedOrigins, setAllowedOrigins] = useState("");
   const [apiUrl, setApiUrl] = useState("");
   const [ttl, setTtl] = useState("");
   const [saving, setSaving] = useState(false);
@@ -21,6 +22,7 @@ export function Settings() {
   const apply = useCallback((c: ServerConfig) => {
     setConfig(c);
     setDomains(c.domains.join("\n"));
+    setAllowedOrigins(c.allowed_origins.join("\n"));
     setApiUrl(c.api_public_url ?? "");
     setTtl(c.admin_session_ttl_secs != null ? String(c.admin_session_ttl_secs) : "");
   }, []);
@@ -43,6 +45,7 @@ export function Settings() {
       }
       await api.updateSettings({
         domains: toLines(domains),
+        allowed_origins: toLines(allowedOrigins),
         api_public_url: apiUrl.trim(),
         admin_session_ttl_secs: ttlNum,
       });
@@ -95,6 +98,11 @@ export function Settings() {
             <Field label="Virtual-host base domains" hint="One per line, e.g. cdn.example.com — enables <bucket>.<domain>. Per-bucket custom domains are set from the Buckets page.">
               <TextArea value={domains} onChange={setDomains} placeholder={"cdn.example.com"} rows={4} />
             </Field>
+            <div className="mt-4">
+              <Field label="Allowed CORS origins (public endpoint)" hint="One per line, e.g. https://app.example.com. Sets Access-Control-Allow-Origin so browsers accept fonts and other cross-origin reads from the public endpoint. Use * to allow any origin. Leave blank to send no CORS headers.">
+                <TextArea value={allowedOrigins} onChange={setAllowedOrigins} placeholder={"https://app.example.com"} rows={4} />
+              </Field>
+            </div>
           </Card>
 
           <Card className="p-5">

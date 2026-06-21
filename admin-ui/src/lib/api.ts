@@ -49,6 +49,7 @@ export interface ServerConfig {
   public_buckets: string[];
   domains: string[];
   domain_map: string[];
+  allowed_origins: string[];
   api_public_url?: string | null;
   admin_session_ttl_secs?: number;
   admin_path: string;
@@ -61,6 +62,7 @@ export interface SettingsUpdate {
   public_buckets?: string[];
   domains?: string[];
   domain_map?: string[];
+  allowed_origins?: string[];
   api_public_url?: string;
   admin_session_ttl_secs?: number;
 }
