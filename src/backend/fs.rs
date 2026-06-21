@@ -130,10 +130,21 @@ impl FileSystem {
     }
 
     /// resolve object path under the virtual root
+    ///
+    /// The resolved path is confined to the object's *own bucket* directory, not
+    /// merely the data root. A key such as `../other-bucket/secret` resolves to a
+    /// path that is still inside the data root, so `absolutize_virtually` alone
+    /// would accept it and leak a sibling bucket's objects (critically, anonymous
+    /// reads through the public port). Reject any key that escapes its bucket.
     pub(crate) fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
+        let bucket_root = self.get_bucket_path(bucket)?;
         let dir = Path::new(&bucket);
         let file_path = Path::new(&key);
-        self.resolve_abs_path(dir.join(file_path))
+        let resolved = self.resolve_abs_path(dir.join(file_path))?;
+        if !resolved.starts_with(&bucket_root) {
+            return Err(Error::from_string(format!("object key escapes its bucket: {key}")));
+        }
+        Ok(resolved)
     }
 
     /// resolve bucket path under the virtual root

@@ -314,6 +314,30 @@ async fn public_port_serves_public_buckets_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_port_path_traversal_into_private_bucket() {
+    let srv = spawn_public(vec!["assets".to_owned()], vec![]).await;
+    let a = srv.addr;
+
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/logo.txt"), b"PUBLIC").unwrap();
+    std::fs::create_dir_all(srv.root.join("secret")).unwrap();
+    std::fs::write(srv.root.join("secret/data.txt"), b"PRIVATE").unwrap();
+
+    // A legitimate public read still works.
+    assert_eq!(get(a, "/assets/logo.txt").body, b"PUBLIC");
+
+    // Literal `..` in the key, climbing out of the public bucket into the private one.
+    let literal = get(a, "/assets/../secret/data.txt");
+    assert_ne!(literal.body, b"PRIVATE", "LITERAL TRAVERSAL LEAKED PRIVATE OBJECT");
+    assert_ne!(literal.status, 200, "literal traversal must not succeed");
+
+    // Percent-encoded `..%2F` to survive any client/proxy normalization.
+    let encoded = get(a, "/assets/..%2Fsecret%2Fdata.txt");
+    assert_ne!(encoded.body, b"PRIVATE", "ENCODED TRAVERSAL LEAKED PRIVATE OBJECT");
+    assert_ne!(encoded.status, 200, "encoded traversal must not succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_port_rejects_anonymous_even_for_public_buckets() {
     // The API port is strict: a "public" bucket is irrelevant without a signature.
     let srv = spawn(true, vec!["assets".to_owned()], vec![]).await;
