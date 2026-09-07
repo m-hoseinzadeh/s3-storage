@@ -46,6 +46,8 @@ pub struct AdminState {
     /// Runtime-editable settings (public buckets, domains, domain map, API URL,
     /// session TTL), persisted in SQLite and managed via the panel.
     pub(crate) settings: SharedSettings,
+    /// Whether `X-Forwarded-Proto` may be believed (see [`Config::trust_proxy`]).
+    pub(crate) trust_proxy: bool,
     pub(crate) version: &'static str,
 }
 
@@ -70,6 +72,7 @@ impl AdminState {
             access_key,
             secret_key,
             settings,
+            trust_proxy: config.trust_proxy,
             version: env!("CARGO_PKG_VERSION"),
         }
     }

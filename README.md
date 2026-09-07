@@ -136,9 +136,11 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
 
 - **Login** uses your S3 access key + secret key; a signed, `HttpOnly` session
   cookie (lifetime set in the panel's Settings page) keeps you signed in. The cookie is
-  marked `Secure` only when the request arrives over HTTPS (detected via
-  `X-Forwarded-Proto`, set by a TLS-terminating reverse proxy, or the request
-  scheme), so it works over plain HTTP too — though serving the panel over
+  marked `Secure` only when the request arrives over HTTPS — from the request
+  scheme, or from `X-Forwarded-Proto` when you run with `--trust-proxy`
+  (`S3_TRUST_PROXY=true`) to say a TLS-terminating reverse proxy sets that header.
+  Set it behind such a proxy; leave it off otherwise, since any client can send the
+  header itself. The panel works over plain HTTP too — though serving it over
   **HTTPS** is strongly recommended so the session cookie is never sent in the
   clear. No SigV4 signing
   happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the

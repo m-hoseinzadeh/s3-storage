@@ -51,6 +51,11 @@ fn unique_dir() -> PathBuf {
 }
 
 fn admin_config(root: PathBuf) -> Config {
+    admin_config_with(root, false)
+}
+
+/// `trust_proxy` decides whether `X-Forwarded-Proto` may be believed.
+fn admin_config_with(root: PathBuf, trust_proxy: bool) -> Config {
     Config {
         root,
         host: "127.0.0.1".to_owned(),
@@ -60,6 +65,7 @@ fn admin_config(root: PathBuf) -> Config {
         secret_key: Some("admin-secret".to_owned()),
         admin_enabled: true,
         admin_port: 0,
+        trust_proxy,
     }
 }
 
@@ -282,15 +288,19 @@ async fn admin_login_and_session() {
     assert!(!set_cookie.contains("Secure"), "plain-HTTP login cookie must not be Secure: {set_cookie}");
     assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"));
 
-    // Behind a TLS-terminating proxy (X-Forwarded-Proto: https) it must be Secure.
-    let https = request(
+    // `X-Forwarded-Proto` is just a request header, so without `--trust-proxy` it
+    // must not let a client decide whether its own cookie is protected.
+    let spoofed = request(
         a,
         "POST",
         "/api/login",
         &[JSON, ("X-Forwarded-Proto", "https")],
         Some(br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#),
     );
-    assert!(https.header("set-cookie").unwrap().contains("Secure"), "HTTPS login cookie must be Secure");
+    assert!(
+        !spoofed.header("set-cookie").unwrap().contains("Secure"),
+        "X-Forwarded-Proto must be ignored unless a proxy is trusted"
+    );
 
     // The cookie authorizes API calls.
     let session = request(a, "GET", "/api/session", &[("Cookie", &cookie)], None);
@@ -773,4 +783,27 @@ async fn admin_login_backs_off_after_repeated_failures() {
     let after = std::time::Instant::now();
     assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
     assert!(after.elapsed() < std::time::Duration::from_millis(500), "a success must clear the backoff");
+}
+
+/// With `--trust-proxy` set, the operator has declared that a TLS-terminating proxy
+/// sits in front and sets `X-Forwarded-Proto` itself, so it is believed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_honors_forwarded_proto_when_proxy_is_trusted() {
+    let root = unique_dir();
+    let config = admin_config_with(root.clone(), true);
+    let settings = seed_settings(&root, vec![], None);
+    let service = build_admin_service(&config, open_backend(&config).unwrap(), &settings);
+    let (a, _shutdown) = serve_service(service).await;
+
+    let body = br#"{"access_key":"admin-key","secret_key":"admin-secret"}"#;
+    let https = request(a, "POST", "/api/login", &[JSON, ("X-Forwarded-Proto", "https")], Some(body));
+    assert!(https.header("set-cookie").unwrap().contains("Secure"), "HTTPS login cookie must be Secure");
+
+    // A proxy chain lists the client first.
+    let chained = request(a, "POST", "/api/login", &[JSON, ("X-Forwarded-Proto", "https, http")], Some(body));
+    assert!(chained.header("set-cookie").unwrap().contains("Secure"));
+
+    // Plain HTTP through the same proxy still gets a usable, non-Secure cookie.
+    let plain = request(a, "POST", "/api/login", &[JSON, ("X-Forwarded-Proto", "http")], Some(body));
+    assert!(!plain.header("set-cookie").unwrap().contains("Secure"));
 }

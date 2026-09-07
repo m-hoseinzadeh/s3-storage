@@ -49,6 +49,14 @@ pub struct Config {
     /// root of this dedicated port, so it can sit behind its own admin domain.
     #[arg(long, env = "S3_ADMIN_PORT", default_value_t = 8081)]
     pub admin_port: u16,
+
+    /// Trust `X-Forwarded-Proto` from the client, to detect HTTPS behind a
+    /// TLS-terminating reverse proxy. Enable this **only** when such a proxy is in
+    /// front and sets the header itself; with the server directly reachable, any
+    /// client can set it and choose whether its own admin session cookie is marked
+    /// `Secure`.
+    #[arg(long, env = "S3_TRUST_PROXY", default_value_t = false)]
+    pub trust_proxy: bool,
 }
 
 impl Config {

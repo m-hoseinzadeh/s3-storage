@@ -52,6 +52,7 @@ fn test_config(root: PathBuf, auth: bool) -> Config {
         secret_key,
         admin_enabled: false,
         admin_port: 0,
+        trust_proxy: false,
     }
 }
 

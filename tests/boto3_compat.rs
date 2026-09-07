@@ -47,6 +47,7 @@ async fn boto3_sdk_compatibility() {
         secret_key: Some(SECRET_KEY.to_owned()),
         admin_enabled: false,
         admin_port: 0,
+        trust_proxy: false,
     };
 
     let settings = SettingsStore::open(&root).unwrap();

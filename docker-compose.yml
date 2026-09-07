@@ -22,6 +22,11 @@ services:
       # Disabled unless S3_ACCESS_KEY/S3_SECRET_KEY are set (log in with those keys).
       S3_ADMIN_ENABLED: ${S3_ADMIN_ENABLED:-false}
 
+      # Set true ONLY behind a TLS-terminating reverse proxy that sets
+      # X-Forwarded-Proto itself; it is what marks the admin session cookie Secure.
+      # With the container directly reachable, any client can send that header.
+      S3_TRUST_PROXY: ${S3_TRUST_PROXY:-false}
+
       # NOTE: the deployment-facing settings below are NOT environment variables.
       # They are stored in the settings DB under /data and managed live from the
       # admin panel (enable it with S3_ADMIN_ENABLED above):

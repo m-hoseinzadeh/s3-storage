@@ -36,7 +36,7 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
     }
 
     // Login and logout are the only unauthenticated endpoints.
-    let secure = request_is_secure(&headers, &uri);
+    let secure = request_is_secure(state, &headers, &uri);
     match (&method, tail) {
         (&Method::POST, ["login"]) => return finish(login(state, &headers, body, secure).await),
         (&Method::POST, ["logout"]) => return finish(Ok(logout(state, secure))),
@@ -170,11 +170,14 @@ fn check_same_origin(method: &Method, headers: &HeaderMap, uri: &hyper::Uri) -> 
 
 /// Whether the original client request reached the server over HTTPS.
 ///
-/// Honors `X-Forwarded-Proto` (set by TLS-terminating reverse proxies, possibly a
-/// comma-separated proxy chain whose first entry is the client) and falls back to
-/// the request URI scheme. Drives whether the session cookie gets `Secure`.
-fn request_is_secure(headers: &HeaderMap, uri: &hyper::Uri) -> bool {
-    if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok())
+/// Drives whether the session cookie gets `Secure`. `X-Forwarded-Proto` (possibly a
+/// comma-separated proxy chain whose first entry is the client) is consulted only
+/// when the operator has declared a trusted proxy via `--trust-proxy`: it is an
+/// ordinary request header, so with the server directly reachable any client could
+/// otherwise dictate whether its own session cookie is protected.
+fn request_is_secure(state: &AdminState, headers: &HeaderMap, uri: &hyper::Uri) -> bool {
+    if state.trust_proxy
+        && let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok())
         && let Some(first) = proto.split(',').next()
     {
         return first.trim().eq_ignore_ascii_case("https");
