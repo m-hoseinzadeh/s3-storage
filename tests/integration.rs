@@ -801,3 +801,26 @@ async fn multipart_part_numbers_and_list_parts() {
     let unknown = request(a, "GET", &host, "/bkt/obj?uploadId=00000000-0000-4000-8000-000000000000", None);
     assert_eq!(unknown.status, 403);
 }
+
+/// `DeleteObject` and `DeleteObjects` must treat a folder-placeholder key the same
+/// way: the batch path used to skip trailing-slash keys outright while still
+/// reporting them deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_removes_empty_folder_placeholders() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+    assert_eq!(request(a, "PUT", &host, "/bkt/empty/", None).status, 200);
+
+    let listed = get(a, "/bkt?list-type=2&delimiter=/");
+    assert!(String::from_utf8_lossy(&listed.body).contains("empty/"));
+
+    let body = b"<Delete><Object><Key>empty/</Key></Object></Delete>";
+    let del = request(a, "POST", &host, "/bkt?delete", Some(body));
+    assert_eq!(del.status, 200, "{}", String::from_utf8_lossy(&del.body));
+
+    let after = get(a, "/bkt?list-type=2&delimiter=/");
+    let after = String::from_utf8_lossy(&after.body).into_owned();
+    assert!(!after.contains("empty/"), "batch delete must remove the placeholder: {after}");
+}

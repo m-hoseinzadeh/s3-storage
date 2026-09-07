@@ -243,16 +243,7 @@ impl S3 for FileSystem {
         if path.exists().not() {
             return Err(s3_error!(NoSuchKey));
         }
-        if input.key.ends_with('/') {
-            let mut dir = try_!(fs::read_dir(&path).await);
-            let is_empty = try_!(dir.next_entry().await).is_none();
-            if is_empty {
-                try_!(fs::remove_dir(&path).await);
-            }
-        } else {
-            try_!(fs::remove_file(&path).await);
-            self.delete_object_sidecars(&input.bucket, &input.key).await?;
-        }
+        self.remove_object(&input.bucket, &input.key, &path).await?;
         self.prune_empty_dirs(path.parent(), &bucket_root).await;
         let output = DeleteObjectOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
@@ -271,9 +262,8 @@ impl S3 for FileSystem {
             let path = self.get_object_path(&input.bucket, &object.key)?;
             // S3 DeleteObjects is idempotent: a key that does not exist is still
             // reported as deleted. Only an actual removal failure is an error.
-            if path.exists() && !object.key.ends_with('/') {
-                try_!(fs::remove_file(&path).await);
-                self.delete_object_sidecars(&input.bucket, &object.key).await?;
+            if path.exists() {
+                self.remove_object(&input.bucket, &object.key, &path).await?;
                 self.prune_empty_dirs(path.parent(), &bucket_root).await;
             }
 
@@ -1182,6 +1172,30 @@ impl S3 for FileSystem {
 }
 
 impl FileSystem {
+    /// Remove the on-disk representation of one key, with its sidecars.
+    ///
+    /// Shared by `DeleteObject` and `DeleteObjects`, which used to disagree: the
+    /// batch path skipped every key ending in `/` outright while still reporting it
+    /// deleted, so an empty folder placeholder that the single-key path removes
+    /// survived a batch delete of the very same key.
+    ///
+    /// A trailing-slash key is a folder placeholder, stored here as a real
+    /// directory, so it can only go away once empty. While keys still live under it
+    /// the directory has to stay -- which matches S3, where a prefix keeps existing
+    /// for as long as it has objects beneath it.
+    async fn remove_object(&self, bucket: &str, key: &str, path: &Path) -> S3Result<()> {
+        if key.ends_with('/') {
+            let mut dir = try_!(fs::read_dir(path).await);
+            if try_!(dir.next_entry().await).is_none() {
+                try_!(fs::remove_dir(path).await);
+            }
+            return Ok(());
+        }
+        try_!(fs::remove_file(path).await);
+        self.delete_object_sidecars(bucket, key).await?;
+        Ok(())
+    }
+
     /// Remove directories left empty by a delete, walking up from `dir` towards
     /// `bucket_root` (exclusive).
     ///
