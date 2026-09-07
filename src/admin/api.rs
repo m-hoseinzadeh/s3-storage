@@ -244,39 +244,52 @@ struct NameBody {
     name: String,
 }
 
-async fn create_bucket(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let b: NameBody = read_json(body).await?;
-    if b.name.trim().is_empty() {
+/// Reject a bucket name that does not satisfy the AWS naming rules.
+///
+/// The S3 ports validate bucket names while parsing the request, but the admin
+/// panel calls the backend directly, so every handler that takes a bucket name has
+/// to enforce the same rules itself. Skipping this on a read/delete path is not
+/// merely cosmetic: a name such as `.s3-storage` resolves to an internal directory
+/// under the data root, so an unchecked `DeleteBucket` would wipe the settings
+/// database. The backend guards this too; checking here turns a 500 into a clear
+/// 400 that names the problem.
+fn check_bucket(bucket: &str) -> Result<(), ApiError> {
+    if bucket.trim().is_empty() {
         return Err(ApiError::bad_request("bucket name is required"));
     }
-    // The S3 ports validate bucket names during request parsing, but the admin
-    // panel calls the backend directly, so enforce the same AWS naming rules here.
-    // Otherwise an invalid name (path separators, leading dot, etc.) could create a
-    // directory that no S3 client can ever address.
-    if !s3s::path::check_bucket_name(&b.name) {
+    if !s3s::path::check_bucket_name(bucket) {
         return Err(ApiError::bad_request(
             "invalid bucket name (3-63 chars: lowercase letters, digits, '.', '-'; \
              must start and end alphanumeric, no '..', not an IP)",
         ));
     }
+    Ok(())
+}
+
+async fn create_bucket(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let b: NameBody = read_json(body).await?;
+    check_bucket(&b.name)?;
     let input = CreateBucketInput { bucket: b.name.clone(), ..Default::default() };
     state.fs.create_bucket(state.s3_request(input)).await?;
     Ok(json_ok(serde_json::json!({ "ok": true, "name": b.name })))
 }
 
 async fn delete_bucket(state: &AdminState, bucket: &str) -> Result<S3Response<Body>, ApiError> {
+    check_bucket(bucket)?;
     let input = DeleteBucketInput { bucket: bucket.to_owned(), ..Default::default() };
     state.fs.delete_bucket(state.s3_request(input)).await?;
     Ok(json_ok(serde_json::json!({ "ok": true })))
 }
 
 async fn bucket_exists(state: &AdminState, bucket: &str) -> Result<S3Response<Body>, ApiError> {
+    check_bucket(bucket)?;
     let input = HeadBucketInput { bucket: bucket.to_owned(), ..Default::default() };
     let exists = state.fs.head_bucket(state.s3_request(input)).await.is_ok();
     Ok(json_ok(serde_json::json!({ "exists": exists })))
 }
 
 async fn bucket_location(state: &AdminState, bucket: &str) -> Result<S3Response<Body>, ApiError> {
+    check_bucket(bucket)?;
     let input = GetBucketLocationInput { bucket: bucket.to_owned(), ..Default::default() };
     let out = state.fs.get_bucket_location(state.s3_request(input)).await?.output;
     Ok(json_ok(serde_json::json!({

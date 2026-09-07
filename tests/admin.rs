@@ -625,3 +625,30 @@ async fn admin_public_toggle_serves_on_public_port() {
     assert_eq!(r.status, 200);
     assert_eq!(r.body, b"PUBLIC");
 }
+
+/// The bucket name in `/api/buckets/{name}` is a raw path segment, so the handlers
+/// must apply the AWS naming rules themselves. Without that, `.s3-storage` resolves
+/// to the internal state directory under the data root and `DeleteBucket` removes
+/// the settings database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_rejects_internal_and_invalid_bucket_names() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let auth = [("Cookie", cookie.as_str())];
+
+    for name in [".s3-storage", "..", "a", "UPPER", "has/slash", "bad..name"] {
+        let path = format!("/api/buckets/{}", name.replace('/', "%2F"));
+        let del = request(a, "DELETE", &path, &auth, None);
+        assert_eq!(del.status, 400, "DELETE {name} must be rejected, got {}", del.text());
+        let loc = request(a, "GET", &format!("{path}/location"), &auth, None);
+        assert_eq!(loc.status, 400, "location {name} must be rejected");
+        let ex = request(a, "GET", &format!("{path}/exists"), &auth, None);
+        assert_eq!(ex.status, 400, "exists {name} must be rejected");
+    }
+
+    // The settings store survived: it is still readable and still has its defaults.
+    let cfg = request(a, "GET", "/api/config", &auth, None);
+    assert_eq!(cfg.status, 200);
+    assert!(cfg.text().contains("\"assets\""), "settings db must be intact: {}", cfg.text());
+}

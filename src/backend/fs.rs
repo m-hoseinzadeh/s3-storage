@@ -148,7 +148,16 @@ impl FileSystem {
     }
 
     /// resolve bucket path under the virtual root
+    ///
+    /// The name is checked against the AWS bucket-naming rules first. `s3s` already
+    /// rejects malformed names while parsing S3 requests, but the admin panel calls
+    /// the backend directly, so without this guard a name like `.s3-storage` would
+    /// resolve to an internal directory under the data root and `DeleteBucket` would
+    /// happily remove it. Every bucket path in the backend funnels through here.
     pub(crate) fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
+        if !s3s::path::check_bucket_name(bucket) {
+            return Err(Error::from_string(format!("invalid bucket name: {bucket}")));
+        }
         let dir = Path::new(&bucket);
         self.resolve_abs_path(dir)
     }
