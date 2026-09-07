@@ -143,6 +143,14 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   clear. No SigV4 signing
   happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the
   admin port) that reuses the storage backend directly, so no CORS setup is needed.
+- **Writes are same-origin only.** `SameSite=Strict` scopes the session cookie to
+  the registrable domain, which still counts a public bucket served from a sibling
+  subdomain (`files.example.com` vs `admin.example.com`) as same-site — and public
+  buckets serve caller-supplied HTML. So every non-`GET` `/api/*` request is also
+  checked against `Origin` / `Sec-Fetch-Site`, and JSON endpoints require
+  `Content-Type: application/json` (which an HTML form cannot send). Scripting the
+  admin API with curl or an SDK is unaffected: a request with no `Origin` is not
+  browser-initiated and passes.
 - **Covers every server feature**: dashboard stats, bucket create/delete with a
   live public/private toggle, a Settings page for domains / custom-domain map /
   public API URL / session lifetime, an object browser (folder navigation, drag-and-drop

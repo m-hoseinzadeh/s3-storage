@@ -683,3 +683,42 @@ async fn admin_zip_extract_is_all_or_nothing_on_unsafe_paths() {
     let head = request(a, "GET", "/api/object/head?bucket=slipmix&key=out%2Fsafe.txt", &auth, None);
     assert_eq!(head.status, 404, "nothing may be written before the archive is validated");
 }
+
+/// `SameSite=Strict` scopes the session cookie to the registrable domain, so a page
+/// served from a public bucket on a sibling subdomain is "same-site" and its
+/// requests carry the session. Writes must therefore be checked against the origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_rejects_cross_origin_writes() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let own_origin = format!("http://{a}");
+    let sibling = ("Origin", "http://files.example.com");
+
+    // A sibling-subdomain page cannot drive a write, however valid the session.
+    let body = br#"{"name":"pwned"}"#;
+    let attack = [("Cookie", cookie.as_str()), JSON, sibling];
+    let r = request(a, "POST", "/api/buckets", &attack, Some(body));
+    assert_eq!(r.status, 403, "{}", r.text());
+
+    // `Sec-Fetch-Site: same-site` describes exactly that case and is refused too.
+    let sfs = [("Cookie", cookie.as_str()), JSON, ("Sec-Fetch-Site", "same-site")];
+    assert_eq!(request(a, "POST", "/api/buckets", &sfs, Some(body)).status, 403);
+
+    // A form can only send simple content types; JSON endpoints refuse them.
+    let form = [("Cookie", cookie.as_str()), ("Content-Type", "text/plain")];
+    assert_eq!(request(a, "POST", "/api/buckets", &form, Some(body)).status, 415);
+
+    // The panel's own same-origin request still works.
+    let ok = [("Cookie", cookie.as_str()), JSON, ("Origin", own_origin.as_str()), ("Sec-Fetch-Site", "same-origin")];
+    assert_eq!(request(a, "POST", "/api/buckets", &ok, Some(body)).status, 200);
+
+    // So does a non-browser client, which sends no Origin at all.
+    let cli = [("Cookie", cookie.as_str()), JSON];
+    let r = request(a, "POST", "/api/buckets", &cli, Some(br#"{"name":"from-cli"}"#));
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // Reads are unaffected.
+    let read = [("Cookie", cookie.as_str()), sibling];
+    assert_eq!(request(a, "GET", "/api/buckets", &read, None).status, 200);
+}

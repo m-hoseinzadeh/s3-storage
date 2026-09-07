@@ -30,10 +30,15 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
     // segs[0] == "api"
     let tail: &[&str] = &segs[1..];
 
+    // Reject browser-initiated cross-site writes before anything else runs.
+    if let Err(err) = check_same_origin(&method, &headers, &uri) {
+        return err.into_response();
+    }
+
     // Login and logout are the only unauthenticated endpoints.
     let secure = request_is_secure(&headers, &uri);
     match (&method, tail) {
-        (&Method::POST, ["login"]) => return finish(login(state, body, secure).await),
+        (&Method::POST, ["login"]) => return finish(login(state, &headers, body, secure).await),
         (&Method::POST, ["logout"]) => return finish(Ok(logout(state, secure))),
         _ => {}
     }
@@ -48,29 +53,29 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
             "authenticated": true, "access_key": state.access_key,
         }))),
         (&Method::GET, ["config"]) => Ok(config(state)),
-        (&Method::PUT, ["settings"]) => update_settings(state, body).await,
+        (&Method::PUT, ["settings"]) => update_settings(state, &headers, body).await,
         (&Method::GET, ["stats"]) => stats(state).await,
 
         (&Method::GET, ["buckets"]) => list_buckets(state).await,
-        (&Method::POST, ["buckets"]) => create_bucket(state, body).await,
+        (&Method::POST, ["buckets"]) => create_bucket(state, &headers, body).await,
         (&Method::DELETE, ["buckets", bucket]) => delete_bucket(state, &dec(bucket)).await,
         (&Method::GET, ["buckets", bucket, "exists"]) => bucket_exists(state, &dec(bucket)).await,
         (&Method::GET, ["buckets", bucket, "location"]) => bucket_location(state, &dec(bucket)).await,
 
         (&Method::GET, ["objects"]) => list_objects(state, &query).await,
-        (&Method::POST, ["objects", "delete"]) => delete_objects(state, body).await,
+        (&Method::POST, ["objects", "delete"]) => delete_objects(state, &headers, body).await,
 
         (&Method::GET, ["object", "head"]) => head_object(state, &query).await,
         (&Method::GET, ["object", "get"]) => get_object(state, &query).await,
         (&Method::PUT, ["object", "put"]) => put_object(state, &query, &headers, body).await,
-        (&Method::POST, ["object", "copy"]) => copy_object(state, body, false).await,
-        (&Method::POST, ["object", "move"]) => copy_object(state, body, true).await,
-        (&Method::POST, ["object", "extract"]) => extract_object(state, body).await,
-        (&Method::POST, ["object", "metadata"]) => update_metadata(state, body).await,
+        (&Method::POST, ["object", "copy"]) => copy_object(state, &headers, body, false).await,
+        (&Method::POST, ["object", "move"]) => copy_object(state, &headers, body, true).await,
+        (&Method::POST, ["object", "extract"]) => extract_object(state, &headers, body).await,
+        (&Method::POST, ["object", "metadata"]) => update_metadata(state, &headers, body).await,
         (&Method::GET, ["object", "presign"]) => presign_object(state, &query),
         (&Method::DELETE, ["object"]) => delete_object(state, &query).await,
 
-        (&Method::POST, ["folder"]) => create_folder(state, body).await,
+        (&Method::POST, ["folder"]) => create_folder(state, &headers, body).await,
 
         (&Method::GET, ["multipart"]) => list_multipart(state, &query).await,
         (&Method::DELETE, ["multipart"]) => abort_multipart(state, &query).await,
@@ -89,8 +94,8 @@ struct LoginBody {
     secret_key: String,
 }
 
-async fn login(state: &AdminState, body: Body, secure: bool) -> Result<S3Response<Body>, ApiError> {
-    let creds: LoginBody = read_json(body).await?;
+async fn login(state: &AdminState, headers: &HeaderMap, body: Body, secure: bool) -> Result<S3Response<Body>, ApiError> {
+    let creds: LoginBody = read_json(headers, body).await?;
     if !state.sessions.verify_credentials(&creds.access_key, &creds.secret_key) {
         return Err(ApiError::unauthorized("invalid access key or secret key"));
     }
@@ -104,6 +109,58 @@ fn logout(state: &AdminState, secure: bool) -> S3Response<Body> {
     let mut resp = json_ok(serde_json::json!({ "ok": true }));
     set_cookie(&mut resp.headers, &state.sessions.clear_cookie(secure));
     resp
+}
+
+/// Reject a state-changing request that a browser initiated from another site.
+///
+/// The session cookie is `HttpOnly; SameSite=Strict`, but "site" means the
+/// registrable domain, not the origin: a page served from a public bucket at
+/// `files.example.com` counts as same-site with an admin panel at
+/// `admin.example.com`, so the session cookie rides along with its requests. Public
+/// buckets exist precisely to serve caller-supplied HTML -- the ZIP extract feature
+/// unpacks uploaded static sites -- so that page is attacker-controlled content, and
+/// `SameSite` alone does not keep it away from these handlers.
+///
+/// A request carrying no `Origin` is a non-browser client (curl, a script, an SDK)
+/// and is allowed through: every current browser sends `Origin` on a non-safe
+/// method, so its absence is not something a page can arrange.
+fn check_same_origin(method: &Method, headers: &HeaderMap, uri: &hyper::Uri) -> Result<(), ApiError> {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return Ok(());
+    }
+    let refuse = || {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "CrossOrigin",
+            "cross-origin request rejected: the admin API only accepts writes from its own origin",
+        )
+    };
+
+    // `Sec-Fetch-Site` is decisive where the browser sends it. `same-site` is
+    // exactly the sibling-subdomain case `SameSite=Strict` lets through.
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        let site = site.trim();
+        if !site.eq_ignore_ascii_case("same-origin") && !site.eq_ignore_ascii_case("none") {
+            return Err(refuse());
+        }
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    // Compare authorities only: behind a TLS-terminating proxy the scheme we see is
+    // not the one the browser used. An opaque origin ("null") matches nothing.
+    let origin_authority = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        // HTTP/2 carries the authority in `:authority` rather than a `Host` header.
+        .or_else(|| uri.authority().map(hyper::http::uri::Authority::as_str))
+        .unwrap_or_default();
+    if host.is_empty() || !origin_authority.eq_ignore_ascii_case(host) {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
 /// Whether the original client request reached the server over HTTPS.
@@ -146,8 +203,8 @@ fn config(state: &AdminState) -> S3Response<Body> {
     }))
 }
 
-async fn update_settings(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let upd: SettingsUpdate = read_json(body).await?;
+async fn update_settings(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let upd: SettingsUpdate = read_json(headers, body).await?;
     upd.validate().map_err(ApiError::bad_request)?;
     // rusqlite is blocking; run the transaction off the async runtime. The store is
     // an `Arc`, so cloning the handle into the blocking task is cheap.
@@ -251,8 +308,8 @@ fn check_bucket(bucket: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn create_bucket(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let b: NameBody = read_json(body).await?;
+async fn create_bucket(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let b: NameBody = read_json(headers, body).await?;
     check_bucket(&b.name)?;
     let input = CreateBucketInput { bucket: b.name.clone(), ..Default::default() };
     state.fs.create_bucket(state.s3_request(input)).await?;
@@ -414,8 +471,8 @@ struct CopyBody {
     dst_key: String,
 }
 
-async fn copy_object(state: &AdminState, body: Body, remove_source: bool) -> Result<S3Response<Body>, ApiError> {
-    let c: CopyBody = read_json(body).await?;
+async fn copy_object(state: &AdminState, headers: &HeaderMap, body: Body, remove_source: bool) -> Result<S3Response<Body>, ApiError> {
+    let c: CopyBody = read_json(headers, body).await?;
     let input = CopyObjectInput::builder()
         .bucket(c.dst_bucket.clone())
         .key(c.dst_key.clone())
@@ -478,8 +535,8 @@ struct ZipEntry {
 /// and written as they arrive. Collecting them all first meant `MAX_TOTAL_UNCOMPRESSED`
 /// was not a guard against a zip bomb blowing up memory -- it *was* the ceiling, 4 GiB
 /// of resident entries on top of the 1 GiB archive.
-async fn extract_object(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let b: ExtractBody = read_json(body).await?;
+async fn extract_object(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let b: ExtractBody = read_json(headers, body).await?;
     if b.key.ends_with('/') {
         return Err(ApiError::bad_request("the selected key is a folder, not an archive"));
     }
@@ -693,8 +750,8 @@ struct MetadataBody {
     metadata: Option<HashMap<String, String>>,
 }
 
-async fn update_metadata(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let m: MetadataBody = read_json(body).await?;
+async fn update_metadata(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let m: MetadataBody = read_json(headers, body).await?;
     // The object must exist before we (re)write its metadata sidecar.
     let head = HeadObjectInput { bucket: m.bucket.clone(), key: m.key.clone(), ..Default::default() };
     state.fs.head_object(state.s3_request(head)).await?;
@@ -773,8 +830,8 @@ struct BatchDeleteBody {
     keys: Vec<String>,
 }
 
-async fn delete_objects(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let b: BatchDeleteBody = read_json(body).await?;
+async fn delete_objects(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let b: BatchDeleteBody = read_json(headers, body).await?;
     let objects: Vec<ObjectIdentifier> =
         b.keys.into_iter().map(|key| ObjectIdentifier { key, ..Default::default() }).collect();
     let input = DeleteObjectsInput::builder()
@@ -795,8 +852,8 @@ struct FolderBody {
     prefix: String,
 }
 
-async fn create_folder(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
-    let f: FolderBody = read_json(body).await?;
+async fn create_folder(state: &AdminState, headers: &HeaderMap, body: Body) -> Result<S3Response<Body>, ApiError> {
+    let f: FolderBody = read_json(headers, body).await?;
     let mut key = f.prefix;
     if !key.ends_with('/') {
         key.push('/');
@@ -931,7 +988,29 @@ fn ts_iso(ts: &Timestamp) -> Option<serde_json::Value> {
     String::from_utf8(buf).ok().map(serde_json::Value::String)
 }
 
-async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, ApiError> {
+/// Require `Content-Type: application/json` on a JSON endpoint.
+///
+/// Defence in depth behind [`check_same_origin`]: an HTML form can only ever send
+/// `text/plain`, `application/x-www-form-urlencoded` or `multipart/form-data`, so
+/// insisting on JSON puts every JSON handler out of reach of form-based CSRF even
+/// if the origin check is somehow bypassed. `fetch` cannot set this header
+/// cross-origin without a preflight, which the admin port never answers.
+fn check_json_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let ct = headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    // Ignore any `; charset=...` parameter.
+    let essence = ct.split(';').next().unwrap_or_default().trim();
+    if essence.eq_ignore_ascii_case("application/json") {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "UnsupportedMediaType",
+        "this endpoint requires `Content-Type: application/json`",
+    ))
+}
+
+async fn read_json<T: DeserializeOwned>(headers: &HeaderMap, body: Body) -> Result<T, ApiError> {
+    check_json_content_type(headers)?;
     let bytes = read_body(body).await?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))
 }
