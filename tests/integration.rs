@@ -717,3 +717,41 @@ async fn delete_bucket_refuses_while_not_empty() {
     assert_eq!(request(a, "DELETE", &host, "/bkt", None).status, 204);
     assert_eq!(get(a, "/bkt").status, 404);
 }
+
+/// The metadata/checksum sidecars live at the data root, not inside the bucket, so
+/// a delete that leaves them behind lets a later object at the same key inherit the
+/// dead one's checksums. `CopyObject` used to skip rewriting the destination's
+/// checksum sidecar when the source had none, which is exactly how that surfaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_an_object_clears_its_sidecars() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    let crc = |r: &Resp| r.header("x-amz-checksum-crc32").unwrap_or("").to_owned();
+
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+
+    // "one" (crc32 emyG8Q==) is stored with a checksum, so a sidecar is written.
+    let put = request_h(a, "PUT", &host, "/bkt/target", &[("x-amz-checksum-crc32", "emyG8Q==")], Some(b"one"));
+    assert_eq!(put.status, 200);
+    assert_eq!(crc(&get(a, "/bkt/target")), "emyG8Q==");
+
+    // Delete it; the sidecars must go too.
+    assert_eq!(request(a, "DELETE", &host, "/bkt/target", None).status, 204);
+    let leftovers: Vec<String> = std::fs::read_dir(&srv.root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".bucket-"))
+        .collect();
+    assert!(leftovers.is_empty(), "sidecars left behind: {leftovers:?}");
+
+    // Copy a checksum-less object onto the freed key: it must report its own
+    // (absent) checksum, not the deleted object's.
+    assert_eq!(request(a, "PUT", &host, "/bkt/src", Some(b"two")).status, 200);
+    let copy = request_h(a, "PUT", &host, "/bkt/target", &[("x-amz-copy-source", "/bkt/src")], None);
+    assert_eq!(copy.status, 200);
+    let got = get(a, "/bkt/target");
+    assert_eq!(got.body, b"two");
+    assert_eq!(crc(&got), "", "copied object must not inherit the deleted object's checksum");
+}

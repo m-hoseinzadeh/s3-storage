@@ -171,21 +171,23 @@ impl S3 for FileSystem {
 
             debug!(from = %src_path.display(), to = %dst_path.display(), "copy file");
 
+            // The destination's sidecars must describe the bytes just written, never
+            // whatever previously lived at that key. Always replace them -- clearing
+            // when the source has none -- so a leftover sidecar can never be adopted.
             let src_metadata_path = self.get_metadata_path(bucket, key, None)?;
+            let dst_metadata_path = self.get_metadata_path(&input.bucket, &input.key, None)?;
             if src_metadata_path.exists() {
-                let dst_metadata_path = self.get_metadata_path(&input.bucket, &input.key, None)?;
-                let _ = try_!(fs::copy(src_metadata_path, dst_metadata_path).await);
+                let _ = try_!(fs::copy(src_metadata_path, &dst_metadata_path).await);
+            } else {
+                crate::backend::fs::remove_file_if_exists(&dst_metadata_path).await?;
             }
 
             // Carry over the checksum sidecar so the copy reports the same checksums,
             // but drop any stored multipart ETag: the copy is a fresh object whose
             // ETag is its own MD5, not the source's `<...>-<n>` value.
-            if let Some(mut info) = self.load_internal_info(bucket, key).await? {
-                info.remove("etag");
-                if !info.is_empty() {
-                    self.save_internal_info(&input.bucket, &input.key, &info).await?;
-                }
-            }
+            let mut info = self.load_internal_info(bucket, key).await?.unwrap_or_default();
+            info.remove("etag");
+            self.save_internal_info(&input.bucket, &input.key, &info).await?;
         }
 
         let md5_sum = self.get_md5_sum(bucket, key).await?;
@@ -237,6 +239,7 @@ impl S3 for FileSystem {
             }
         } else {
             try_!(fs::remove_file(&path).await);
+            self.delete_object_sidecars(&input.bucket, &input.key).await?;
         }
         self.prune_empty_dirs(path.parent(), &bucket_root).await;
         let output = DeleteObjectOutput::default(); // TODO: handle other fields
@@ -258,6 +261,7 @@ impl S3 for FileSystem {
             // reported as deleted. Only an actual removal failure is an error.
             if path.exists() && !object.key.ends_with('/') {
                 try_!(fs::remove_file(&path).await);
+                self.delete_object_sidecars(&input.bucket, &object.key).await?;
                 self.prune_empty_dirs(path.parent(), &bucket_root).await;
             }
 

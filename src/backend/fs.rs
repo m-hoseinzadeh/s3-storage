@@ -88,6 +88,15 @@ impl ObjectAttributes {
     }
 }
 
+/// Remove `path`, treating "already gone" as success.
+pub(crate) async fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn clean_old_tmp_files(root: &Path) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => Ok(entries),
@@ -226,6 +235,20 @@ impl FileSystem {
     pub(crate) fn delete_metadata(&self, bucket: &str, key: &str, upload_id: Option<Uuid>) -> Result<()> {
         let path = self.get_metadata_path(bucket, key, upload_id)?;
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// Remove both sidecars belonging to an object.
+    ///
+    /// The metadata and checksum sidecars live at the data root, not inside the
+    /// bucket directory, so removing the object file alone leaves them behind
+    /// forever. Besides the unbounded leak (their base64 names also spell out
+    /// deleted keys), a survivor can later be adopted by a *different* object
+    /// written to the same key and make the server advertise the dead object's
+    /// checksums or multipart ETag. Missing files are not an error.
+    pub(crate) async fn delete_object_sidecars(&self, bucket: &str, key: &str) -> Result<()> {
+        remove_file_if_exists(&self.get_metadata_path(bucket, key, None)?).await?;
+        remove_file_if_exists(&self.get_internal_info_path(bucket, key)?).await?;
         Ok(())
     }
 
