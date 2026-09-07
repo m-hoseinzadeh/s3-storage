@@ -652,3 +652,34 @@ async fn admin_rejects_internal_and_invalid_bucket_names() {
     assert_eq!(cfg.status, 200);
     assert!(cfg.text().contains("\"assets\""), "settings db must be intact: {}", cfg.text());
 }
+
+/// Entries stream from the inflate task to the writer, so an archive with a
+/// zip-slip path must still be rejected before *any* of its entries land, and a
+/// well-formed archive must extract every entry in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_zip_extract_is_all_or_nothing_on_unsafe_paths() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+    let auth = [("Cookie", cookie.as_str())];
+    let auth_json = [("Cookie", cookie.as_str()), JSON];
+
+    request(a, "POST", "/api/buckets", &auth_json, Some(br#"{"name":"slipmix"}"#));
+
+    // A safe entry ahead of an escaping one: the safe entry must not be written.
+    let zip = make_zip(&[("safe.txt", b"ok"), ("../escape.txt", b"pwned")]);
+    let put = request(a, "PUT", "/api/object/put?bucket=slipmix&key=mix.zip", &auth, Some(&zip));
+    assert_eq!(put.status, 200);
+
+    let r = request(
+        a,
+        "POST",
+        "/api/object/extract",
+        &auth_json,
+        Some(br#"{"bucket":"slipmix","key":"mix.zip","dest_prefix":"out/"}"#),
+    );
+    assert_eq!(r.status, 400, "{}", r.text());
+
+    let head = request(a, "GET", "/api/object/head?bucket=slipmix&key=out%2Fsafe.txt", &auth, None);
+    assert_eq!(head.status, 404, "nothing may be written before the archive is validated");
+}

@@ -444,6 +444,10 @@ const MAX_ZIP_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_TOTAL_UNCOMPRESSED: u64 = 4 * 1024 * 1024 * 1024;
 /// Cap on the number of files a single archive may expand into.
 const MAX_ENTRIES: usize = 50_000;
+/// Decompressed entries buffered between the blocking inflate and the writer. Kept
+/// tiny on purpose: it is what keeps peak memory at a couple of files rather than
+/// the whole expanded archive.
+const EXTRACT_QUEUE_DEPTH: usize = 1;
 
 #[derive(serde::Deserialize)]
 struct ExtractBody {
@@ -469,6 +473,11 @@ struct ZipEntry {
 /// each file entry is written as its own object under `dest_prefix`. Directory
 /// entries become implicit S3 prefixes (we never write the folder placeholders).
 /// Paths are validated against zip-slip and bounded by the size/count caps above.
+///
+/// Entries are streamed from the inflate task to the writer over a depth-1 channel
+/// and written as they arrive. Collecting them all first meant `MAX_TOTAL_UNCOMPRESSED`
+/// was not a guard against a zip bomb blowing up memory -- it *was* the ceiling, 4 GiB
+/// of resident entries on top of the 1 GiB archive.
 async fn extract_object(state: &AdminState, body: Body) -> Result<S3Response<Body>, ApiError> {
     let b: ExtractBody = read_json(body).await?;
     if b.key.ends_with('/') {
@@ -492,35 +501,38 @@ async fn extract_object(state: &AdminState, body: Body) -> Result<S3Response<Bod
     let dest = dest.trim_start_matches('/').to_owned();
     let dest = if dest.is_empty() || dest.ends_with('/') { dest } else { format!("{dest}/") };
 
-    // ZIP parsing + inflate is blocking and CPU-bound; keep it off the runtime.
+    // ZIP parsing + inflate is blocking and CPU-bound; keep it off the runtime, and
+    // hand entries over one at a time so only the file being written is resident.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ZipEntry>(EXTRACT_QUEUE_DEPTH);
     let dest_for_task = dest.clone();
-    let entries = tokio::task::spawn_blocking(move || decompress_zip(&archive, &dest_for_task))
-        .await
-        .map_err(|e| ApiError::internal(format!("extraction task failed: {e}")))?
-        .map_err(ApiError::bad_request)?;
+    let inflate = tokio::task::spawn_blocking(move || decompress_zip(&archive, &dest_for_task, &tx));
 
-    // Write each extracted file as its own object.
     let mut extracted = Vec::new();
     let mut skipped = Vec::new();
-    for entry in entries {
-        if !b.overwrite {
-            let head = HeadObjectInput { bucket: b.bucket.clone(), key: entry.name.clone(), ..Default::default() };
-            if state.fs.head_object(state.s3_request(head)).await.is_ok() {
-                skipped.push(entry.name);
-                continue;
+    let mut write_err = None;
+    while let Some(entry) = rx.recv().await {
+        match write_zip_entry(state, &b.bucket, entry, b.overwrite).await {
+            Ok((name, true)) => extracted.push(name),
+            Ok((name, false)) => skipped.push(name),
+            Err(e) => {
+                write_err = Some(e);
+                break;
             }
         }
-        let len = i64::try_from(entry.data.len()).unwrap_or(i64::MAX);
-        let put = PutObjectInput {
-            bucket: b.bucket.clone(),
-            key: entry.name.clone(),
-            body: Some(Body::from(entry.data).into()),
-            content_type: guess_content_type(&entry.name),
-            content_length: Some(len),
-            ..Default::default()
-        };
-        state.fs.put_object(state.s3_request(put)).await?;
-        extracted.push(entry.name);
+    }
+    // Dropping the receiver unblocks the inflate task if we bailed out early.
+    drop(rx);
+    let produced = inflate
+        .await
+        .map_err(|e| ApiError::internal(format!("extraction task failed: {e}")))?;
+
+    // A write failure is the more useful diagnosis, so it wins over the send error
+    // the inflate task sees once we stop receiving.
+    if let Some(err) = write_err {
+        return Err(err);
+    }
+    if produced.map_err(ApiError::bad_request)? == 0 {
+        return Err(ApiError::bad_request("archive contains no files to extract"));
     }
 
     Ok(json_ok(serde_json::json!({
@@ -532,10 +544,40 @@ async fn extract_object(state: &AdminState, body: Body) -> Result<S3Response<Bod
     })))
 }
 
-/// Decompress every file entry in `archive`, prefixing each name with `dest`.
-/// Runs inside `spawn_blocking`. Returns a user-facing error string on any
-/// malformed entry, unsafe path, or breach of the size/count caps.
-fn decompress_zip(archive: &[u8], dest: &str) -> Result<Vec<ZipEntry>, String> {
+/// Store one extracted file as its own object, honouring `overwrite`.
+/// Returns the object key and whether it was actually written.
+async fn write_zip_entry(
+    state: &AdminState,
+    bucket: &str,
+    entry: ZipEntry,
+    overwrite: bool,
+) -> Result<(String, bool), ApiError> {
+    if !overwrite {
+        let head = HeadObjectInput { bucket: bucket.to_owned(), key: entry.name.clone(), ..Default::default() };
+        if state.fs.head_object(state.s3_request(head)).await.is_ok() {
+            return Ok((entry.name, false));
+        }
+    }
+    let len = i64::try_from(entry.data.len()).unwrap_or(i64::MAX);
+    let put = PutObjectInput {
+        bucket: bucket.to_owned(),
+        key: entry.name.clone(),
+        body: Some(Body::from(entry.data).into()),
+        content_type: guess_content_type(&entry.name),
+        content_length: Some(len),
+        ..Default::default()
+    };
+    state.fs.put_object(state.s3_request(put)).await?;
+    Ok((entry.name, true))
+}
+
+/// Decompress every file entry in `archive`, prefixing each name with `dest`, and
+/// hand each one to `sink` as soon as it is inflated. Runs inside `spawn_blocking`.
+///
+/// Returns the number of entries produced, or a user-facing error string on any
+/// malformed entry, unsafe path, or breach of the size/count caps. A closed `sink`
+/// means the consumer gave up (and will report its own error), so we stop quietly.
+fn decompress_zip(archive: &[u8], dest: &str, sink: &tokio::sync::mpsc::Sender<ZipEntry>) -> Result<usize, String> {
     use std::io::Read;
 
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
@@ -544,14 +586,28 @@ fn decompress_zip(archive: &[u8], dest: &str) -> Result<Vec<ZipEntry>, String> {
         return Err(format!("archive has too many entries (limit {MAX_ENTRIES})"));
     }
 
-    let mut entries = Vec::new();
+    // Validate every path before writing anything. Reading names does not inflate,
+    // so this is cheap, and it keeps an archive containing a zip-slip entry from
+    // being partially extracted before the bad entry is reached.
+    for i in 0..zip.len() {
+        let file = zip.by_index(i).map_err(|e| format!("failed to read entry {i}: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        if file.enclosed_name().is_none() {
+            return Err(format!("archive contains an unsafe path: {}", file.name()));
+        }
+    }
+
+    let mut produced = 0usize;
     let mut total: u64 = 0;
     for i in 0..zip.len() {
         let file = zip.by_index(i).map_err(|e| format!("failed to read entry {i}: {e}"))?;
         if file.is_dir() {
             continue;
         }
-        // `enclosed_name` rejects absolute paths and `..` traversal (zip-slip).
+        // `enclosed_name` rejects absolute paths and `..` traversal (zip-slip); the
+        // pass above already proved every entry has one.
         let rel = file
             .enclosed_name()
             .ok_or_else(|| format!("archive contains an unsafe path: {}", file.name()))?
@@ -575,13 +631,13 @@ fn decompress_zip(archive: &[u8], dest: &str) -> Result<Vec<ZipEntry>, String> {
             ));
         }
         total += data.len() as u64;
-        entries.push(ZipEntry { name: format!("{dest}{rel}"), data });
+        if sink.blocking_send(ZipEntry { name: format!("{dest}{rel}"), data }).is_err() {
+            return Ok(produced);
+        }
+        produced += 1;
     }
 
-    if entries.is_empty() {
-        return Err("archive contains no files to extract".to_owned());
-    }
-    Ok(entries)
+    Ok(produced)
 }
 
 /// Best-effort Content-Type from a file extension, so extracted sites/assets are
