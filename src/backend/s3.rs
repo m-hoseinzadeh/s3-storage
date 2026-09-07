@@ -207,17 +207,24 @@ impl S3 for FileSystem {
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
-        if path.exists() {
-            try_!(fs::remove_dir_all(path).await);
-        } else {
+        if path.exists().not() {
             return Err(s3_error!(NoSuchBucket));
         }
+        // S3 refuses to delete a bucket that still holds objects; the caller has to
+        // empty it first. Deleting the tree outright would turn `aws s3 rb` (without
+        // `--force`) and the panel's delete button into silent recursive deletes.
+        let mut entries = try_!(fs::read_dir(&path).await);
+        if try_!(entries.next_entry().await).is_some() {
+            return Err(s3_error!(BucketNotEmpty, "The bucket you tried to delete is not empty"));
+        }
+        try_!(fs::remove_dir(&path).await);
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
     #[tracing::instrument]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
+        let bucket_root = self.get_bucket_path(&input.bucket)?;
         let path = self.get_object_path(&input.bucket, &input.key)?;
         if path.exists().not() {
             return Err(s3_error!(NoSuchKey));
@@ -231,6 +238,7 @@ impl S3 for FileSystem {
         } else {
             try_!(fs::remove_file(&path).await);
         }
+        self.prune_empty_dirs(path.parent(), &bucket_root).await;
         let output = DeleteObjectOutput::default(); // TODO: handle other fields
         Ok(S3Response::new(output))
     }
@@ -242,13 +250,15 @@ impl S3 for FileSystem {
         // successful ones are omitted. We never report per-key failures here, so a
         // quiet request yields an empty `Deleted` list.
         let quiet = input.delete.quiet.unwrap_or(false);
+        let bucket_root = self.get_bucket_path(&input.bucket)?;
         let mut deleted_objects: Vec<DeletedObject> = Vec::new();
         for object in input.delete.objects {
             let path = self.get_object_path(&input.bucket, &object.key)?;
             // S3 DeleteObjects is idempotent: a key that does not exist is still
             // reported as deleted. Only an actual removal failure is an error.
             if path.exists() && !object.key.ends_with('/') {
-                try_!(fs::remove_file(path).await);
+                try_!(fs::remove_file(&path).await);
+                self.prune_empty_dirs(path.parent(), &bucket_root).await;
             }
 
             if !quiet {
@@ -1146,6 +1156,31 @@ impl S3 for FileSystem {
 }
 
 impl FileSystem {
+    /// Remove directories left empty by a delete, walking up from `dir` towards
+    /// `bucket_root` (exclusive).
+    ///
+    /// S3 prefixes are implicit: once the last object under `a/b/` is gone, `a/b/`
+    /// must stop existing. On disk the key structure is real directories, so
+    /// without this a deleted tree lingers as phantom common prefixes in listings
+    /// and keeps `DeleteBucket` reporting `BucketNotEmpty` for a bucket the client
+    /// has already emptied.
+    ///
+    /// Best-effort: `remove_dir` only succeeds on an empty directory, so it both
+    /// tests and performs each prune, and any failure (still populated, or a racing
+    /// writer) simply stops the walk. Explicitly created empty folder placeholders
+    /// are unaffected -- they are never the parent of the object being deleted.
+    async fn prune_empty_dirs(&self, dir: Option<&Path>, bucket_root: &Path) {
+        let Some(dir) = dir else { return };
+        let mut dir = dir.to_owned();
+        while dir != bucket_root && dir.starts_with(bucket_root) {
+            if fs::remove_dir(&dir).await.is_err() {
+                break;
+            }
+            let Some(parent) = dir.parent() else { break };
+            dir = parent.to_owned();
+        }
+    }
+
     /// The ETag to advertise for an object: the stored multipart ETag
     /// (`<md5-of-part-md5s>-<n>`) when present, otherwise the whole-object MD5.
     async fn object_etag(&self, bucket: &str, key: &str) -> S3Result<String> {

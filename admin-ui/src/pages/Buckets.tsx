@@ -198,7 +198,7 @@ export function Buckets() {
         onConfirm={remove}
         loading={busy}
         title={`Delete bucket “${toDelete}”?`}
-        message="This permanently deletes the bucket and every object it contains. This action cannot be undone."
+        message="The bucket must be empty. Delete its objects from the Object Browser first, then remove the bucket here."
       />
     </div>
   );

@@ -688,3 +688,32 @@ async fn cors_allowed_origins_update_takes_effect_live() {
     let after = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://app.example.com")], None);
     assert_eq!(after.header("access-control-allow-origin"), Some("https://app.example.com"));
 }
+
+/// S3 refuses to remove a bucket that still holds objects; the caller empties it
+/// first. Deleting the tree outright would make `aws s3 rb` a silent recursive
+/// delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_bucket_refuses_while_not_empty() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+    assert_eq!(request(a, "PUT", &host, "/bkt/nested/keep.txt", Some(b"data")).status, 200);
+
+    let refused = request(a, "DELETE", &host, "/bkt", None);
+    let body = String::from_utf8_lossy(&refused.body).into_owned();
+    assert_eq!(refused.status, 409, "{body}");
+    assert!(body.contains("BucketNotEmpty"), "{body}");
+    // The object is untouched.
+    assert_eq!(get(a, "/bkt/nested/keep.txt").body, b"data");
+
+    // Emptying it makes the delete succeed. Removing the last object under
+    // `nested/` also prunes the directory, so no phantom prefix is left to block it.
+    assert_eq!(request(a, "DELETE", &host, "/bkt/nested/keep.txt", None).status, 204);
+    let listing = get(a, "/bkt?list-type=2&delimiter=/");
+    let listing = String::from_utf8_lossy(&listing.body).into_owned();
+    assert!(!listing.contains("nested/"), "emptied prefix must disappear: {listing}");
+    assert_eq!(request(a, "DELETE", &host, "/bkt", None).status, 204);
+    assert_eq!(get(a, "/bkt").status, 404);
+}
