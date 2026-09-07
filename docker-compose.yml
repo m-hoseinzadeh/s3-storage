@@ -9,9 +9,14 @@ services:
       - "8081:8081"   # admin   — web panel + its API (served at root)
       - "8082:8082"   # public  — anonymous read-only of public buckets
     environment:
-      # SigV4 credentials. Set both; the API is open/unauthenticated if unset.
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3storage}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3storage-secret}
+      # SigV4 credentials. Required: compose refuses to start without them, rather
+      # than falling back to a shared default that is published in this repository
+      # (all three ports below are bound on every interface).
+      # Generate a pair and put them in a .env file beside this compose file:
+      #   printf 'S3_ACCESS_KEY=%s\nS3_SECRET_KEY=%s\n' \
+      #     "$(openssl rand -hex 12)" "$(openssl rand -base64 32)" > .env
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY (see .env note above)}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY (see .env note above)}
 
       # Listener ports (match the published ports above).
       S3_PORT: ${S3_PORT:-8080}

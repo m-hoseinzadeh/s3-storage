@@ -1,3 +1,5 @@
 /target
 /data
 *.log
+# Local compose credentials (see docker-compose.yml).
+.env

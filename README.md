@@ -37,12 +37,18 @@ custom-domain routing) are this project's own.
 ## Quick start (Docker Compose)
 
 ```bash
+# Generate credentials. Compose requires them: it publishes all three ports on
+# every interface, so there is no safe shared default to fall back to.
+printf 'S3_ACCESS_KEY=%s\nS3_SECRET_KEY=%s\n' \
+  "$(openssl rand -hex 12)" "$(openssl rand -base64 32)" > .env
+
 # Build and run
 docker compose up --build -d
 
 # Configure the AWS CLI against it
-export AWS_ACCESS_KEY_ID=s3storage
-export AWS_SECRET_ACCESS_KEY=s3storage-secret
+export $(grep -v '^#' .env | xargs)
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
 aws --endpoint-url http://localhost:8080 s3 mb s3://demo
 echo "hello" | aws --endpoint-url http://localhost:8080 s3 cp - s3://demo/hello.txt
 aws --endpoint-url http://localhost:8080 s3 ls s3://demo/
@@ -196,9 +202,11 @@ services:
       - "8081:8081"   # admin panel
       - "8082:8082"   # public reads
     environment:
-      S3_ACCESS_KEY: s3storage
-      S3_SECRET_KEY: s3storage-secret
+      # Required — from a .env file beside the compose file, never a literal.
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
       S3_ADMIN_ENABLED: "true"             # then set public buckets / domains in the panel
+      S3_TRUST_PROXY: "false"              # true only behind a TLS-terminating proxy
       RUST_LOG: info
     volumes:
       - s3data:/data                       # or:  - ./data:/data
@@ -212,8 +220,10 @@ volumes:
 
 ```bash
 docker build -t s3-storage .
+export S3_ACCESS_KEY="$(openssl rand -hex 12)"
+export S3_SECRET_KEY="$(openssl rand -base64 32)"
 docker run -d --name s3-storage -p 8080:8080 -p 8081:8081 -p 8082:8082 \
-  -e S3_ACCESS_KEY=s3storage -e S3_SECRET_KEY=s3storage-secret \
+  -e S3_ACCESS_KEY -e S3_SECRET_KEY \
   -e S3_ADMIN_ENABLED=true \
   -v s3data:/data \
   s3-storage
@@ -225,14 +235,16 @@ docker run -d --name s3-storage -p 8080:8080 -p 8081:8081 -p 8082:8082 \
 ### Python (boto3)
 
 ```python
+import os
+
 import boto3
 from botocore.config import Config
 
 s3 = boto3.client(
     "s3",
     endpoint_url="http://localhost:8080",
-    aws_access_key_id="s3storage",
-    aws_secret_access_key="s3storage-secret",
+    aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+    aws_secret_access_key=os.environ["S3_SECRET_KEY"],
     region_name="us-east-1",
     config=Config(s3={"addressing_style": "path"}),
 )
@@ -249,7 +261,7 @@ let conf = aws_sdk_s3::config::Builder::new()
     .endpoint_url("http://localhost:8080")
     .region(aws_sdk_s3::config::Region::new("us-east-1"))
     .credentials_provider(aws_sdk_s3::config::Credentials::new(
-        "s3storage", "s3storage-secret", None, None, "static"))
+        std::env::var("S3_ACCESS_KEY")?, std::env::var("S3_SECRET_KEY")?, None, None, "static"))
     .force_path_style(true)
     .build();
 let client = aws_sdk_s3::Client::from_conf(conf);
