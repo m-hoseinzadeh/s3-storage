@@ -40,7 +40,7 @@ pub use crate::backend::FileSystem;
 pub use crate::config::Config;
 pub use crate::cors::CorsService;
 pub use crate::host::CustomHost;
-pub use crate::settings::{RuntimeSettings, SettingsStore, SettingsUpdate, SharedSettings};
+pub use crate::settings::{CorsDecision, RuntimeSettings, SettingsStore, SettingsUpdate, SharedSettings};
 
 /// Open the on-disk storage backend. A single instance is shared by all three
 /// services so they share its atomic temp-file counter and never collide on writes.

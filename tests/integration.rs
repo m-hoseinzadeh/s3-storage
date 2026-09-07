@@ -870,3 +870,46 @@ async fn list_objects_clamps_max_keys_and_pages_correctly() {
     let expected: Vec<String> = (0..7).map(|i| format!("k{i}")).collect();
     assert_eq!(seen, expected);
 }
+
+/// A response whose CORS headers depend on the request's `Origin` must carry
+/// `Vary: Origin` even when the origin is *rejected*, or a shared cache in front of
+/// the public endpoint can serve one origin's answer to another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_varies_by_origin_even_when_denied() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["https://ok.example".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let vary = |r: &Resp| r.header("vary").unwrap_or("").to_owned();
+
+    let allowed = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://ok.example")], None);
+    assert_eq!(allowed.header("access-control-allow-origin"), Some("https://ok.example"));
+    assert!(vary(&allowed).contains("Origin"), "allowed origin must vary");
+
+    let denied = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://evil.example")], None);
+    assert_eq!(denied.header("access-control-allow-origin"), None);
+    assert!(vary(&denied).contains("Origin"), "denied origin must vary too");
+
+    // A request with no Origin still comes from the same origin-dependent resource.
+    let plain = get(a, "/assets/font.woff2");
+    assert!(vary(&plain).contains("Origin"), "origin-dependent resource must always vary");
+
+    // A rejected preflight varies as well.
+    let preflight = request_h(a, "OPTIONS", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://evil.example")], None);
+    assert!(vary(&preflight).contains("Origin"), "denied preflight must vary");
+}
+
+/// With a wildcard allow-list every origin gets the same answer, so no `Vary` is
+/// needed and caching stays effective.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_wildcard_does_not_vary() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["*".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let r = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://any.example")], None);
+    assert_eq!(r.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(r.header("vary"), None, "a wildcard answer is identical for every origin");
+}

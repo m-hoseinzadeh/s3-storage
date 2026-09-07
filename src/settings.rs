@@ -116,6 +116,17 @@ impl SettingsUpdate {
     }
 }
 
+/// How the public endpoint should answer one request's CORS handling.
+#[derive(Debug, Clone)]
+pub struct CorsDecision {
+    /// Value for `Access-Control-Allow-Origin`, or `None` to send no CORS headers
+    /// (no `Origin` on the request, or an origin that is not allowed).
+    pub allow_origin: Option<String>,
+    /// Whether the response content depends on the request's `Origin`, and so must
+    /// carry `Vary: Origin` even when no CORS headers are added.
+    pub vary: bool,
+}
+
 /// Derived, read-optimized view rebuilt only when settings change, so per-request
 /// reads never parse strings or allocate maps.
 #[derive(Debug)]
@@ -185,21 +196,24 @@ impl SettingsStore {
         self.snapshot.read().unwrap().public_set.contains(bucket)
     }
 
-    /// Resolve the `Access-Control-Allow-Origin` value to return for a request
-    /// carrying the given `Origin`, or `None` if the allow-list does not permit it.
-    /// Returns `"*"` when a wildcard is configured, otherwise the (normalized)
-    /// matching origin so it can be echoed back.
+    /// Resolve how a request carrying `origin` (absent for a non-CORS request)
+    /// should be answered, in one lock acquisition.
     #[must_use]
-    pub fn cors_allow_origin(&self, origin: &str) -> Option<String> {
+    pub fn cors_decision(&self, origin: Option<&str>) -> CorsDecision {
         let snap = self.snapshot.read().unwrap();
-        if snap.allow_any_origin {
-            return Some("*".to_owned());
-        }
-        let origin = origin.trim().trim_end_matches('/');
-        if snap.allowed_origins.contains(origin) {
-            return Some(origin.to_owned());
-        }
-        None
+        // A non-wildcard allow-list means two requests differing only in `Origin`
+        // get different responses, so caches have to key on it -- whether or not
+        // *this* origin matched. A wildcard, or no list at all, answers everyone
+        // identically and needs no `Vary`.
+        let vary = !snap.allow_any_origin && !snap.allowed_origins.is_empty();
+        let allow_origin = origin.and_then(|origin| {
+            if snap.allow_any_origin {
+                return Some("*".to_owned());
+            }
+            let origin = origin.trim().trim_end_matches('/');
+            snap.allowed_origins.contains(origin).then(|| origin.to_owned())
+        });
+        CorsDecision { allow_origin, vary }
     }
 
     /// Resolve a host (without port) to a bucket via custom-domain mapping or

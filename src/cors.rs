@@ -5,7 +5,7 @@
 //! `Access-Control-Allow-Origin` header matching the page's origin. The S3 layer
 //! never emits one, so this thin wrapper stamps it — and answers `OPTIONS`
 //! preflights — whenever the request's `Origin` is permitted by the admin-configured
-//! allow-list ([`SettingsStore::cors_allow_origin`](crate::settings::SettingsStore::cors_allow_origin)).
+//! allow-list ([`SettingsStore::cors_decision`](crate::settings::SettingsStore::cors_decision)).
 //!
 //! It is installed only on the public read endpoint; the authenticated API and the
 //! admin panel are left untouched.
@@ -22,7 +22,7 @@ use hyper::service::Service;
 use hyper::{Method, Request, Response, StatusCode};
 use s3s::{Body, HttpError, HttpResponse};
 
-use crate::settings::SharedSettings;
+use crate::settings::{CorsDecision, SharedSettings};
 
 /// Wraps an S3-serving service and applies CORS headers from the configured
 /// allowed-origins list. The wrapped service must produce an [`HttpResponse`]
@@ -50,15 +50,12 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, HttpError>> + Send + 'static>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        // Resolve the allow-origin decision from the request's `Origin` up front.
-        // `None` here means either no `Origin` (a non-CORS request — e.g. the AWS CLI
-        // or curl) or an origin not on the allow-list; in both cases we add no CORS
-        // headers and behave exactly as the unwrapped service.
-        let allow_origin = req
-            .headers()
-            .get(ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|origin| self.settings.cors_allow_origin(origin));
+        // Resolve the CORS handling from the request's `Origin` up front. A `None`
+        // `allow_origin` means either no `Origin` (a non-CORS request — e.g. the AWS
+        // CLI or curl) or an origin not on the allow-list; in both cases we add no
+        // CORS headers and behave exactly as the unwrapped service.
+        let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
+        let decision = self.settings.cors_decision(origin);
 
         // Preflight: answer `OPTIONS` directly. The public S3 backend only permits
         // GET/HEAD and would reject it, so it must be handled here.
@@ -67,8 +64,8 @@ where
             let mut resp = Response::new(Body::empty());
             *resp.status_mut() = StatusCode::NO_CONTENT;
             let headers = resp.headers_mut();
-            apply_allow_origin(headers, allow_origin.as_deref());
-            if allow_origin.is_some() {
+            apply_cors(headers, &decision);
+            if decision.allow_origin.is_some() {
                 headers.insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, OPTIONS"));
                 headers.insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
                 if let Some(req_headers) = requested_headers {
@@ -81,20 +78,25 @@ where
         let fut = self.inner.call(req);
         Box::pin(async move {
             let mut resp = fut.await?;
-            apply_allow_origin(resp.headers_mut(), allow_origin.as_deref());
+            apply_cors(resp.headers_mut(), &decision);
             Ok(resp)
         })
     }
 }
 
-/// Stamp `Access-Control-Allow-Origin` (plus `Vary: Origin` when the value is
-/// origin-specific, so caches don't serve one origin's header to another). A `None`
-/// decision leaves the headers untouched.
-fn apply_allow_origin(headers: &mut HeaderMap, allow_origin: Option<&str>) {
-    let Some(value) = allow_origin else { return };
-    let Ok(header) = HeaderValue::from_str(value) else { return };
-    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, header);
-    if value != "*" {
+/// Stamp `Access-Control-Allow-Origin` when the origin is allowed, and `Vary: Origin`
+/// whenever the answer depends on the request's origin at all.
+///
+/// The `Vary` must be emitted even on the *deny* path. The public endpoint is meant
+/// to sit behind a CDN, and without it a shared cache can store the header-less
+/// response produced for a disallowed origin and later hand it to an allowed one
+/// (or the reverse), so cross-origin reads fail intermittently for reasons that do
+/// not reproduce.
+fn apply_cors(headers: &mut HeaderMap, decision: &CorsDecision) {
+    if decision.vary {
         headers.append(VARY, HeaderValue::from_static("Origin"));
     }
+    let Some(value) = decision.allow_origin.as_deref() else { return };
+    let Ok(header) = HeaderValue::from_str(value) else { return };
+    headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, header);
 }
