@@ -96,9 +96,14 @@ struct LoginBody {
 
 async fn login(state: &AdminState, headers: &HeaderMap, body: Body, secure: bool) -> Result<S3Response<Body>, ApiError> {
     let creds: LoginBody = read_json(headers, body).await?;
+    // Serializes attempts and pays out the backoff owed by the current failure
+    // streak, so the endpoint cannot be brute-forced in parallel or at speed.
+    let gate = state.login_throttle.acquire().await;
     if !state.sessions.verify_credentials(&creds.access_key, &creds.secret_key) {
+        gate.failed();
         return Err(ApiError::unauthorized("invalid access key or secret key"));
     }
+    gate.succeeded();
     let token = state.sessions.issue();
     let mut resp = json_ok(serde_json::json!({ "ok": true, "access_key": state.access_key }));
     set_cookie(&mut resp.headers, &state.sessions.set_cookie(&token, secure));

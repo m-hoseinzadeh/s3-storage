@@ -743,3 +743,34 @@ async fn admin_sends_security_headers() {
         assert_eq!(r.header("referrer-policy"), Some("no-referrer"), "{path}");
     }
 }
+
+/// Repeated bad logins must get progressively slower, and a correct login must
+/// clear the streak so a legitimate operator pays the penalty at most once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_login_backs_off_after_repeated_failures() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let bad = br#"{"access_key":"admin-key","secret_key":"wrong"}"#;
+
+    // The first few failures are free, so a typo is not punished.
+    let quick = std::time::Instant::now();
+    for _ in 0..3 {
+        assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
+    }
+    assert!(quick.elapsed() < std::time::Duration::from_millis(500), "early attempts must not be delayed");
+
+    // Past that the backoff kicks in and compounds.
+    let slow = std::time::Instant::now();
+    for _ in 0..3 {
+        assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
+    }
+    let delayed = slow.elapsed();
+    assert!(delayed >= std::time::Duration::from_millis(500), "guessing must be throttled, took {delayed:?}");
+
+    // A correct login still works and resets the streak.
+    let cookie = login(a);
+    assert!(!cookie.is_empty());
+    let after = std::time::Instant::now();
+    assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
+    assert!(after.elapsed() < std::time::Duration::from_millis(500), "a success must clear the backoff");
+}

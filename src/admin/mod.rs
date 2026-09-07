@@ -31,7 +31,7 @@ use crate::backend::FileSystem;
 use crate::config::Config;
 use crate::settings::SharedSettings;
 
-use self::auth::Sessions;
+use self::auth::{LoginThrottle, Sessions};
 
 /// Shared state for the admin panel. The deployment-facing settings live in
 /// [`settings`](crate::settings) and are read live; only credentials and the
@@ -39,6 +39,8 @@ use self::auth::Sessions;
 pub struct AdminState {
     pub(crate) fs: Arc<FileSystem>,
     pub(crate) sessions: Sessions,
+    /// Rate limit on the login endpoint (see [`LoginThrottle`]).
+    pub(crate) login_throttle: LoginThrottle,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
     /// Runtime-editable settings (public buckets, domains, domain map, API URL,
@@ -64,6 +66,7 @@ impl AdminState {
         Self {
             fs,
             sessions,
+            login_throttle: LoginThrottle::default(),
             access_key,
             secret_key,
             settings,

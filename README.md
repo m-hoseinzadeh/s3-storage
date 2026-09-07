@@ -143,6 +143,11 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   clear. No SigV4 signing
   happens in the browser — the panel calls a same-origin JSON API (`/api/*` on the
   admin port) that reuses the storage backend directly, so no CORS setup is needed.
+- **Login is rate-limited.** Attempts are serialized and back off exponentially
+  after the first few failures (capped at 5s), so the secret key cannot be
+  brute-forced through the panel. It is a delay rather than a lockout on purpose:
+  with a single credential pair, locking out would let anyone who can reach the
+  port deny you access. A successful login clears the streak.
 - **Writes are same-origin only.** `SameSite=Strict` scopes the session cookie to
   the registrable domain, which still counts a public bucket served from a sibling
   subdomain (`files.example.com` vs `admin.example.com`) as same-site — and public

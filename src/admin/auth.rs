@@ -6,6 +6,8 @@
 //! kept. The signing key is derived from the configured secret key, so tokens
 //! survive restarts but are invalidated if the secret key changes.
 
+use std::time::Duration;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -13,6 +15,71 @@ use subtle::ConstantTimeEq;
 use crate::settings::SharedSettings;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Failed logins that cost nothing, so an ordinary typo is not punished.
+const FREE_ATTEMPTS: u32 = 3;
+/// Penalty for the first failure past [`FREE_ATTEMPTS`]; it doubles from there.
+const BASE_PENALTY: Duration = Duration::from_millis(250);
+/// Ceiling on the penalty, so a locked-out operator is never stuck for long.
+const MAX_PENALTY: Duration = Duration::from_secs(5);
+
+/// Serializing, exponentially backing-off gate on the login endpoint.
+///
+/// Nothing rate-limited login before, so the admin port offered unlimited
+/// guesses at the secret key. Attempts now queue behind a single lock and each
+/// one waits out the penalty earned by the current failure streak, which caps
+/// guessing at roughly one attempt per [`MAX_PENALTY`] no matter how many
+/// requests are made in parallel.
+///
+/// Deliberately a delay rather than a lockout: with a single credential pair a
+/// lockout would let anyone who can reach the port deny the operator access,
+/// trading a brute-force risk for a denial-of-service one. A successful login
+/// clears the streak, so a legitimate operator pays the penalty at most once.
+#[derive(Debug, Default)]
+pub struct LoginThrottle {
+    /// Consecutive failures. Held across the delay so attempts cannot run in
+    /// parallel to escape it.
+    failures: tokio::sync::Mutex<u32>,
+}
+
+impl LoginThrottle {
+    /// Take the login gate, waiting out any penalty owed. The caller must report
+    /// the outcome on the returned guard.
+    pub async fn acquire(&self) -> LoginGate<'_> {
+        let failures = self.failures.lock().await;
+        let penalty = Self::penalty(*failures);
+        if !penalty.is_zero() {
+            tokio::time::sleep(penalty).await;
+        }
+        LoginGate { failures }
+    }
+
+    fn penalty(failures: u32) -> Duration {
+        let Some(over) = failures.checked_sub(FREE_ATTEMPTS) else { return Duration::ZERO };
+        if over == 0 {
+            return Duration::ZERO;
+        }
+        BASE_PENALTY
+            .checked_mul(1u32.checked_shl(over - 1).unwrap_or(u32::MAX))
+            .unwrap_or(MAX_PENALTY)
+            .min(MAX_PENALTY)
+    }
+}
+
+/// Holds the login gate for the duration of one attempt.
+pub struct LoginGate<'a> {
+    failures: tokio::sync::MutexGuard<'a, u32>,
+}
+
+impl LoginGate<'_> {
+    pub fn succeeded(mut self) {
+        *self.failures = 0;
+    }
+
+    pub fn failed(mut self) {
+        *self.failures = self.failures.saturating_add(1);
+    }
+}
 
 /// Name of the session cookie.
 pub const COOKIE_NAME: &str = "s3admin_session";
@@ -135,4 +202,22 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn penalty_is_free_then_doubles_up_to_the_cap() {
+        for failures in 0..=FREE_ATTEMPTS {
+            assert_eq!(LoginThrottle::penalty(failures), Duration::ZERO, "{failures} should be free");
+        }
+        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 1), BASE_PENALTY);
+        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 2), BASE_PENALTY * 2);
+        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 3), BASE_PENALTY * 4);
+        // Never past the ceiling, and no overflow however long the streak runs.
+        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 40), MAX_PENALTY);
+        assert_eq!(LoginThrottle::penalty(u32::MAX), MAX_PENALTY);
+    }
 }
