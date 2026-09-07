@@ -42,10 +42,15 @@ import {
 import { PageHeader, TutList } from "../components/PageHeader";
 
 interface UploadItem {
+  // Identity for progress updates. Two files can share a name (dropped from
+  // different folders), so the name cannot be the key.
+  id: number;
   name: string;
   pct: number;
   error?: string;
 }
+
+let nextUploadId = 0;
 
 export function Browser() {
   const [params, setParams] = useSearchParams();
@@ -102,20 +107,36 @@ export function Browser() {
   // ---- uploads ----
   const doUpload = async (fileList: FileList | File[]) => {
     const arr = Array.from(fileList);
+    let failed = 0;
     for (const file of arr) {
       const key = prefix + file.name;
-      setUploads((u) => [...u, { name: file.name, pct: 0 }]);
+      const id = nextUploadId++;
+      const patch = (fields: Partial<UploadItem>) =>
+        setUploads((u) => u.map((x) => (x.id === id ? { ...x, ...fields } : x)));
+      setUploads((u) => [...u, { id, name: file.name, pct: 0 }]);
       try {
-        await uploadFile(api.uploadUrl(bucket, key, file.type || undefined), file, (pct) =>
-          setUploads((u) => u.map((x) => (x.name === file.name ? { ...x, pct } : x))),
-        );
-        setUploads((u) => u.map((x) => (x.name === file.name ? { ...x, pct: 100 } : x)));
+        await uploadFile(api.uploadUrl(bucket, key, file.type || undefined), file, (pct) => patch({ pct }));
+        patch({ pct: 100 });
       } catch (e) {
-        setUploads((u) => u.map((x) => (x.name === file.name ? { ...x, error: e instanceof ApiError ? e.message : "failed" } : x)));
+        failed++;
+        patch({ error: e instanceof ApiError ? e.message : "failed" });
       }
     }
-    toast("success", `Uploaded ${arr.length} file${arr.length > 1 ? "s" : ""}`);
-    setTimeout(() => setUploads([]), 2500);
+
+    const ok = arr.length - failed;
+    const plural = (n: number) => `${n} file${n === 1 ? "" : "s"}`;
+    if (failed === 0) {
+      toast("success", `Uploaded ${plural(ok)}`);
+      setTimeout(() => setUploads([]), 2500);
+    } else if (ok === 0) {
+      toast("error", `Upload failed for ${plural(failed)}`);
+      // Leave the failures on screen with their reasons instead of reporting
+      // success and clearing them after 2.5s regardless of what happened.
+      setUploads((u) => u.filter((x) => x.error));
+    } else {
+      toast("error", `Uploaded ${plural(ok)}, ${failed} failed`);
+      setUploads((u) => u.filter((x) => x.error));
+    }
     load();
   };
 
@@ -357,10 +378,24 @@ export function Browser() {
       {uploads.length > 0 && (
         <div className="fixed bottom-4 left-1/2 z-40 w-96 -translate-x-1/2">
           <Card className="p-3">
-            <div className="mb-2 text-xs font-medium text-[var(--color-muted-fg)]">Uploading {uploads.length} file(s)</div>
+            <div className="mb-2 flex items-center justify-between gap-2 text-xs font-medium text-[var(--color-muted-fg)]">
+              <span>
+                {uploads.every((u) => u.error)
+                  ? `${uploads.length} upload(s) failed`
+                  : `Uploading ${uploads.length} file(s)`}
+              </span>
+              {uploads.some((u) => u.error) && (
+                <button
+                  onClick={() => setUploads([])}
+                  className="focusable rounded px-1.5 py-0.5 hover:text-[var(--color-fg)] cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              )}
+            </div>
             <div className="space-y-2">
               {uploads.map((u) => (
-                <div key={u.name}>
+                <div key={u.id}>
                   <div className="mb-1 flex justify-between text-xs">
                     <span className="truncate">{u.name}</span>
                     <span className={u.error ? "text-[var(--color-danger)]" : "text-[var(--color-muted-fg)]"}>{u.error ?? `${u.pct}%`}</span>
