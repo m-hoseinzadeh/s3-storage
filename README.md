@@ -295,6 +295,15 @@ it to untrusted networks:
 - **Keep public buckets read-only by intent** — anonymous access is limited to
   `GET`/`HEAD` on buckets you explicitly mark public in the admin panel; writes always
   require a valid signature.
+- **Public reads are served `X-Content-Type-Options: nosniff`**, so a browser
+  honours the stored `Content-Type` instead of sniffing caller-supplied bytes into
+  something more dangerous. Objects stored without a `Content-Type` are therefore
+  not sniffed either — set one on upload (SDKs do) or from the panel's metadata
+  editor if you serve a static site.
+- **The admin panel sends a strict CSP** (`script-src 'self'`,
+  `frame-ancestors 'none'`), so it cannot be framed and clickjacked into one-click
+  destructive actions. Its webfonts come from Google Fonts; if you must run without
+  external requests, self-host them and tighten `style-src`/`font-src`.
 
 Report vulnerabilities privately via the repository's security contact rather than
 a public issue.

@@ -18,7 +18,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hyper::http::Extensions;
-use hyper::header::{CONTENT_TYPE, HeaderValue};
+use hyper::header::{
+    CONTENT_SECURITY_POLICY as CONTENT_SECURITY_POLICY_HEADER, CONTENT_TYPE, HeaderValue, REFERRER_POLICY,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+};
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 use s3s::auth::Credentials;
 use s3s::route::S3Route;
@@ -121,14 +124,37 @@ impl S3Route for AdminRoute {
 
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
         let rel = req.uri.path().to_owned();
-        if rel.starts_with("/api/") || rel == "/api" {
-            Ok(api::dispatch(&self.state, req, &rel).await)
+        let mut resp = if rel.starts_with("/api/") || rel == "/api" {
+            api::dispatch(&self.state, req, &rel).await
         } else {
             // `rel` is "/" or a client-side route; assets::serve maps "/" to
             // index.html and falls back to the SPA shell for unknown routes.
-            Ok(assets::serve(&rel))
-        }
+            assets::serve(&rel)
+        };
+        apply_security_headers(&mut resp.headers);
+        Ok(resp)
     }
+}
+
+/// Content-Security-Policy for the panel.
+///
+/// The Vite bundle loads one external module script and one stylesheet from this
+/// origin, so `script-src 'self'` costs nothing and shuts the door on injected
+/// script. `style-src` keeps `'unsafe-inline'` because React writes element styles
+/// (and the design system pulls its webfonts from Google Fonts); that is a far
+/// weaker lever than script execution. `frame-ancestors 'none'` is the part that
+/// matters operationally: it stops the panel being framed and clickjacked into
+/// destructive one-click actions like deleting a bucket.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self';      script-src 'self';      style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;      font-src 'self' https://fonts.gstatic.com;      img-src 'self' data:;      connect-src 'self';      form-action 'self';      base-uri 'none';      object-src 'none';      frame-ancestors 'none'";
+
+/// Stamp the panel's security headers on every response, SPA and JSON API alike.
+fn apply_security_headers(headers: &mut HeaderMap) {
+    headers.insert(CONTENT_SECURITY_POLICY_HEADER, HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    // Belt and braces for `frame-ancestors`, which older browsers ignore.
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    // Never leak an admin URL (which can carry a bucket and key) to another site.
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 }
 
 // ---- shared response/error helpers (used by the api submodule) ----

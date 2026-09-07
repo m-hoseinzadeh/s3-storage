@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use s3_storage::{
-    Config, CorsService, SettingsStore, SettingsUpdate, SharedSettings, build_api_service, build_public_service,
+    Config, PublicHeaders, SettingsStore, SettingsUpdate, SharedSettings, build_api_service, build_public_service,
     open_backend, serve,
 };
 use s3s::service::S3Service;
@@ -104,7 +104,7 @@ async fn spawn_public(public_buckets: Vec<String>, domain_map: Vec<String>) -> T
     serve_on(root, settings, service).await
 }
 
-/// Spawn the **public** service wrapped in the [`CorsService`] layer, exactly as
+/// Spawn the **public** service wrapped in the [`PublicHeaders`] layer, exactly as
 /// `run()` installs it, with the given allowed-origins list configured.
 async fn spawn_public_cors(public_buckets: Vec<String>, allowed_origins: Vec<String>) -> TestServer {
     use std::sync::Arc;
@@ -119,7 +119,7 @@ async fn spawn_public_cors(public_buckets: Vec<String>, allowed_origins: Vec<Str
         })
         .unwrap();
     let inner = build_public_service(&config, open_backend(&config).unwrap(), &settings);
-    let service = CorsService::new(inner, Arc::clone(&settings));
+    let service = PublicHeaders::new(inner, Arc::clone(&settings));
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -912,4 +912,18 @@ async fn cors_wildcard_does_not_vary() {
     let r = request_h(a, "GET", &a.to_string(), "/assets/font.woff2", &[("Origin", "https://any.example")], None);
     assert_eq!(r.header("access-control-allow-origin"), Some("*"));
     assert_eq!(r.header("vary"), None, "a wildcard answer is identical for every origin");
+}
+
+/// Public buckets serve caller-supplied bytes under a caller-supplied Content-Type,
+/// so responses must forbid MIME sniffing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_reads_forbid_mime_sniffing() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec![]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/note.txt"), b"<script>alert(1)</script>").unwrap();
+
+    let r = get(a, "/assets/note.txt");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
 }

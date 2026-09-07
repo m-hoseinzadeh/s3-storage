@@ -9,7 +9,7 @@ mod access;
 mod admin;
 mod backend;
 mod config;
-mod cors;
+mod public_headers;
 mod host;
 mod settings;
 
@@ -38,7 +38,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 pub use crate::access::{AccessControl, PublicReadAccess};
 pub use crate::backend::FileSystem;
 pub use crate::config::Config;
-pub use crate::cors::CorsService;
+pub use crate::public_headers::PublicHeaders;
 pub use crate::host::CustomHost;
 pub use crate::settings::{CorsDecision, RuntimeSettings, SettingsStore, SettingsUpdate, SharedSettings};
 
@@ -118,7 +118,7 @@ pub fn build_admin_service(config: &Config, fs: Arc<FileSystem>, settings: &Shar
 /// in-flight connections (up to 10s).
 ///
 /// Generic over the service so it accepts both a bare [`S3Service`] and the
-/// [`CorsService`]-wrapped public endpoint; both yield an [`HttpResponse`].
+/// [`PublicHeaders`]-wrapped public endpoint; both yield an [`HttpResponse`].
 pub async fn serve<S>(
     service: S,
     listener: TcpListener,
@@ -174,10 +174,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     let api_listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
     info!("API listening on http://{}", api_listener.local_addr()?);
 
-    // The public endpoint is wrapped in the CORS layer so cross-origin reads
-    // (fonts and other CORS-gated subresources) get the configured
-    // `Access-Control-Allow-Origin` header.
-    let public = CorsService::new(
+    // The public endpoint is wrapped in its response-header layer: the configured
+    // `Access-Control-Allow-Origin` so cross-origin reads (fonts and other
+    // CORS-gated subresources) work, plus `nosniff` over caller-supplied content.
+    let public = PublicHeaders::new(
         build_public_service(&config, Arc::clone(&fs), &settings),
         Arc::clone(&settings),
     );

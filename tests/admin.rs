@@ -722,3 +722,24 @@ async fn admin_rejects_cross_origin_writes() {
     let read = [("Cookie", cookie.as_str()), sibling];
     assert_eq!(request(a, "GET", "/api/buckets", &read, None).status, 200);
 }
+
+/// Every admin response — SPA shell and JSON API alike — must carry the panel's
+/// security headers. `frame-ancestors` is the operationally important one: the
+/// panel offers one-click destructive actions and must not be framable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_sends_security_headers() {
+    let srv = spawn().await;
+    let a = srv.addr;
+    let cookie = login(a);
+
+    for (path, extra) in [("/", &[][..]), ("/api/config", &[("Cookie", cookie.as_str())][..])] {
+        let r = request(a, "GET", path, extra, None);
+        let csp = r.header("content-security-policy").unwrap_or_default();
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}: {csp}");
+        assert!(csp.contains("script-src 'self'"), "{path}: {csp}");
+        assert!(csp.contains("object-src 'none'"), "{path}: {csp}");
+        assert_eq!(r.header("x-frame-options"), Some("DENY"), "{path}");
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"), "{path}");
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"), "{path}");
+    }
+}
