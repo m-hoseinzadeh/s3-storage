@@ -52,6 +52,82 @@ fn normalize_path(path: &Path, delimiter: &str) -> Option<String> {
     Some(normalized)
 }
 
+/// AWS caps a `ListObjects` page at 1000 keys; so do we, for requested and default
+/// page sizes alike.
+const MAX_LIST_KEYS: i32 = 1000;
+
+/// Accumulates one listing page while the directory walk is still running.
+///
+/// The resume marker and the page limit are applied as entries arrive, and only the
+/// `limit + 1` smallest candidates are kept -- one more than the page returns, which
+/// is exactly what `IsTruncated` needs. Previously every key in the bucket was
+/// materialised, sorted, and then almost entirely discarded, so a listing's memory
+/// and sort cost scaled with the bucket instead of with the page.
+///
+/// Walking the tree is still O(objects): without an index there is no way to find
+/// the next N keys without looking at them. What this bounds is what the walk keeps.
+struct ListingPage<'a> {
+    resume_after: Option<&'a str>,
+    /// `limit + 1` -- the page itself plus one lookahead entry.
+    keep: usize,
+    objects: std::collections::BTreeMap<String, Object>,
+    prefixes: std::collections::BTreeSet<String>,
+}
+
+impl<'a> ListingPage<'a> {
+    fn new(resume_after: Option<&'a str>, limit: usize) -> Self {
+        Self {
+            resume_after,
+            keep: limit.saturating_add(1),
+            objects: default(),
+            prefixes: default(),
+        }
+    }
+
+    /// Whether `key` could still make it into the page, given the marker and the
+    /// entries already held. Callers check this before paying for a `stat`.
+    fn accepts(&self, key: &str) -> bool {
+        if self.resume_after.is_some_and(|m| key <= m) {
+            return false;
+        }
+        if self.objects.len() < self.keep {
+            return true;
+        }
+        self.objects.last_key_value().is_none_or(|(largest, _)| key < largest.as_str())
+    }
+
+    fn push_object(&mut self, key: String, object: Object) {
+        if !self.accepts(&key) {
+            return;
+        }
+        self.objects.insert(key, object);
+        while self.objects.len() > self.keep {
+            self.objects.pop_last();
+        }
+    }
+
+    fn push_prefix(&mut self, prefix: String) {
+        if self.resume_after.is_some_and(|m| prefix.as_str() <= m) {
+            return;
+        }
+        self.prefixes.insert(prefix);
+        while self.prefixes.len() > self.keep {
+            self.prefixes.pop_last();
+        }
+    }
+
+    /// The retained candidates, already in key order.
+    fn into_sorted(self) -> (Vec<Object>, Vec<CommonPrefix>) {
+        let objects = self.objects.into_values().collect();
+        let prefixes = self
+            .prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix { prefix: Some(prefix) })
+            .collect();
+        (objects, prefixes)
+    }
+}
+
 /// AWS accepts part numbers 1..=10000. Only the upper bound used to be checked, so
 /// a zero or negative number produced an unaddressable `.part--1` file on disk.
 fn check_part_number(part_number: PartNumber) -> S3Result<()> {
@@ -519,48 +595,30 @@ impl S3 for FileSystem {
 
         let delimiter = input.delimiter.as_deref();
         let prefix = input.prefix.as_deref().unwrap_or("").trim_start_matches('/');
-        let max_keys = input.max_keys.unwrap_or(1000);
-
-        // Collect all matching objects and common prefixes
-        let mut objects: Vec<Object> = default();
-        let mut common_prefixes = std::collections::BTreeSet::new();
-
-        if let Some(delimiter) = delimiter {
-            self.list_objects_with_delimiter(&path, prefix, delimiter, &mut objects, &mut common_prefixes)
-                .await?;
-        } else {
-            self.list_objects_recursive(&path, prefix, &mut objects).await?;
-        }
-
-        // Sort before filtering and limiting
-        objects.sort_by(|lhs, rhs| {
-            let lhs_key = lhs.key.as_deref().unwrap_or("");
-            let rhs_key = rhs.key.as_deref().unwrap_or("");
-            lhs_key.cmp(rhs_key)
-        });
+        // AWS caps a page at 1000 keys and reports the effective value back. Without
+        // a clamp a caller could ask for a single unbounded page of the whole bucket.
+        let max_keys = input.max_keys.unwrap_or(MAX_LIST_KEYS).clamp(0, MAX_LIST_KEYS);
+        let max_keys_usize = usize::try_from(max_keys).unwrap_or(0);
 
         // Resume point: a continuation token takes precedence over start_after, and
         // both mean "return items strictly after this key". The token we emit below
         // is simply the last key returned, so the two are interchangeable here.
         let resume_after = input.continuation_token.as_deref().or(input.start_after.as_deref());
-        if let Some(marker) = resume_after {
-            objects.retain(|obj| obj.key.as_deref().unwrap_or("") > marker);
-        }
 
-        // Convert common_prefixes to sorted list, applying the same resume marker so
-        // paginated delimited listings don't repeat a prefix already returned.
-        let common_prefixes_list: Vec<CommonPrefix> = common_prefixes
-            .into_iter()
-            .filter(|p| resume_after.is_none_or(|m| p.as_str() > m))
-            .map(|prefix| CommonPrefix { prefix: Some(prefix) })
-            .collect();
+        // Collect matching objects and common prefixes, bounded to this page.
+        let mut page = ListingPage::new(resume_after, max_keys_usize);
+        if let Some(delimiter) = delimiter {
+            self.list_objects_with_delimiter(&path, prefix, delimiter, &mut page).await?;
+        } else {
+            self.list_objects_recursive(&path, prefix, &mut page).await?;
+        }
+        let (objects, common_prefixes_list) = page.into_sorted();
 
         // Limit results to max_keys by interleaving objects and common_prefixes,
         // tracking the last key emitted so it can serve as the continuation token.
         let mut result_objects = Vec::new();
         let mut result_prefixes = Vec::new();
         let mut total_count = 0;
-        let max_keys_usize = usize::try_from(max_keys).unwrap_or(1000);
 
         let mut obj_idx = 0;
         let mut prefix_idx = 0;
@@ -1232,7 +1290,7 @@ impl FileSystem {
         Ok(self.get_md5_sum(bucket, key).await?)
     }
 
-    async fn list_objects_recursive(&self, bucket_root: &Path, prefix: &str, objects: &mut Vec<Object>) -> S3Result<()> {
+    async fn list_objects_recursive(&self, bucket_root: &Path, prefix: &str, page: &mut ListingPage<'_>) -> S3Result<()> {
         let mut dir_queue: VecDeque<PathBuf> = default();
         dir_queue.push_back(bucket_root.to_owned());
         let prefix_is_empty = prefix.is_empty();
@@ -1241,16 +1299,30 @@ impl FileSystem {
             let mut iter = try_!(fs::read_dir(dir).await);
             while let Some(entry) = try_!(iter.next_entry().await) {
                 let file_type = try_!(entry.file_type().await);
-                if file_type.is_dir() {
-                    dir_queue.push_back(entry.path());
-                } else {
-                    let file_path = entry.path();
-                    let key = try_!(file_path.strip_prefix(bucket_root));
-                    let Some(key_str) = normalize_path(key, "/") else {
-                        continue;
-                    };
+                let entry_path = entry.path();
+                let key = try_!(entry_path.strip_prefix(bucket_root));
+                let Some(key_str) = normalize_path(key, "/") else {
+                    continue;
+                };
 
+                if file_type.is_dir() {
+                    // Descend only where the prefix can still be satisfied: either
+                    // this directory sits on the path to it, or everything below it
+                    // matches. Walking the whole bucket to filter afterwards made a
+                    // narrow prefix listing cost the same as listing everything.
+                    if !prefix_is_empty {
+                        let dir_prefix = format!("{key_str}/");
+                        if !dir_prefix.starts_with(prefix) && !prefix.starts_with(&dir_prefix) {
+                            continue;
+                        }
+                    }
+                    dir_queue.push_back(entry_path);
+                } else {
                     if !prefix_is_empty && !key_str.starts_with(prefix) {
+                        continue;
+                    }
+                    // Skip the `stat` for keys that cannot reach the page anyway.
+                    if !page.accepts(&key_str) {
                         continue;
                     }
 
@@ -1259,12 +1331,12 @@ impl FileSystem {
                     let size = metadata.len();
 
                     let object = Object {
-                        key: Some(key_str),
+                        key: Some(key_str.clone()),
                         last_modified: Some(last_modified),
                         size: Some(try_!(i64::try_from(size))),
                         ..Default::default()
                     };
-                    objects.push(object);
+                    page.push_object(key_str, object);
                 }
             }
         }
@@ -1277,8 +1349,7 @@ impl FileSystem {
         bucket_root: &Path,
         prefix: &str,
         delimiter: &str,
-        objects: &mut Vec<Object>,
-        common_prefixes: &mut std::collections::BTreeSet<String>,
+        page: &mut ListingPage<'_>,
     ) -> S3Result<()> {
         // For delimiter-based listing, we need to recursively scan all files
         // but group them according to the delimiter rules
@@ -1325,7 +1396,7 @@ impl FileSystem {
                             let mut cp = String::with_capacity(prefix.len() + pos + delimiter.len());
                             cp.push_str(prefix);
                             cp.push_str(&rest[..pos + delimiter.len()]);
-                            common_prefixes.insert(cp);
+                            page.push_prefix(cp);
                         } else {
                             // The prefix directory itself or an ancestor of it: descend
                             // to reach the entries at the listing level.
@@ -1346,21 +1417,25 @@ impl FileSystem {
                             let mut next_prefix = String::with_capacity(prefix.len() + delimiter_pos + 1);
                             next_prefix.push_str(prefix);
                             next_prefix.push_str(&remaining[..=delimiter_pos]);
-                            common_prefixes.insert(next_prefix);
+                            page.push_prefix(next_prefix);
                         }
                     } else {
-                        // File is at the current level, include it in objects
+                        // File is at the current level, include it in objects.
+                        // Skip the `stat` for keys that cannot reach the page anyway.
+                        if !page.accepts(&key_str) {
+                            continue;
+                        }
                         let metadata = try_!(entry.metadata().await);
                         let last_modified = Timestamp::from(try_!(metadata.modified()));
                         let size = metadata.len();
 
                         let object = Object {
-                            key: Some(key_str),
+                            key: Some(key_str.clone()),
                             last_modified: Some(last_modified),
                             size: Some(try_!(i64::try_from(size))),
                             ..Default::default()
                         };
-                        objects.push(object);
+                        page.push_object(key_str, object);
                     }
                 }
             }

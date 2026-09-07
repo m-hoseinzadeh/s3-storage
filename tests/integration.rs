@@ -824,3 +824,49 @@ async fn batch_delete_removes_empty_folder_placeholders() {
     let after = String::from_utf8_lossy(&after.body).into_owned();
     assert!(!after.contains("empty/"), "batch delete must remove the placeholder: {after}");
 }
+
+/// A page is capped at 1000 keys however many are asked for, and the bounded
+/// accumulator must still page correctly and report the effective `MaxKeys`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_objects_clamps_max_keys_and_pages_correctly() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+    for i in 0..7 {
+        let path = format!("/bkt/k{i}");
+        assert_eq!(request(a, "PUT", &host, &path, Some(b"x")).status, 200);
+    }
+
+    // An absurd request is clamped to the 1000-key cap and reported as such.
+    let huge = get(a, "/bkt?list-type=2&max-keys=100000");
+    let huge = String::from_utf8_lossy(&huge.body).into_owned();
+    assert!(huge.contains("<MaxKeys>1000</MaxKeys>"), "max-keys must be clamped: {huge}");
+    assert!(huge.contains("<KeyCount>7</KeyCount>"), "{huge}");
+
+    // Paging with a bounded page returns every key exactly once, in order.
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..10 {
+        let q = match &token {
+            Some(t) => format!("/bkt?list-type=2&max-keys=3&continuation-token={t}"),
+            None => "/bkt?list-type=2&max-keys=3".to_owned(),
+        };
+        let body = String::from_utf8_lossy(&get(a, &q).body).into_owned();
+        for chunk in body.split("<Key>").skip(1) {
+            seen.push(chunk.split_once("</Key>").unwrap().0.to_owned());
+        }
+        if !body.contains("<IsTruncated>true</IsTruncated>") {
+            token = None;
+            break;
+        }
+        token = body
+            .split_once("<NextContinuationToken>")
+            .and_then(|(_, r)| r.split_once("</NextContinuationToken>"))
+            .map(|(t, _)| t.to_owned());
+        assert!(token.is_some(), "truncated page must carry a token: {body}");
+    }
+    assert!(token.is_none(), "listing never terminated");
+    let expected: Vec<String> = (0..7).map(|i| format!("k{i}")).collect();
+    assert_eq!(seen, expected);
+}

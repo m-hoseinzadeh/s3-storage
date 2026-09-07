@@ -392,6 +392,36 @@ impl FileSystem {
         Ok(result)
     }
 
+    /// Count objects and total bytes in a bucket in a single directory walk.
+    ///
+    /// The admin dashboard used to derive this by paging `ListObjectsV2`, but every
+    /// page re-walks the whole bucket, so the cost grew quadratically with the object
+    /// count. One pass, and no per-key allocation.
+    pub(crate) async fn bucket_usage(&self, bucket: &str) -> Result<(u64, u64)> {
+        let root = self.get_bucket_path(bucket)?;
+        let mut count: u64 = 0;
+        let mut size: u64 = 0;
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(dir) = queue.pop_front() {
+            let mut rd = match fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                // The bucket (or a subdirectory) vanishing mid-walk is not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            while let Some(entry) = rd.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    queue.push_back(entry.path());
+                } else {
+                    count += 1;
+                    size += entry.metadata().await?.len();
+                }
+            }
+        }
+        Ok((count, size))
+    }
+
     /// Write to the filesystem atomically.
     /// This is done by first writing to a temporary location and then moving the file.
     pub(crate) async fn prepare_file_write<'a>(&self, path: &'a Path) -> Result<FileWriter<'a>> {

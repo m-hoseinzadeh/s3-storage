@@ -190,33 +190,18 @@ async fn stats(state: &AdminState) -> Result<S3Response<Body>, ApiError> {
     })))
 }
 
-/// Sum object count and bytes for a bucket (paginated, capped to avoid runaway).
+/// Sum object count and bytes for a bucket.
+///
+/// This walks the bucket directory once. It used to page through `ListObjectsV2`
+/// instead, but each of those pages re-walks the whole bucket, so a dashboard load
+/// cost roughly `objects^2 / 1000` directory entries -- and silently under-reported
+/// past a million objects, where the page loop gave up.
 async fn bucket_usage(state: &AdminState, bucket: &str) -> Result<(u64, u64), ApiError> {
-    let mut count: u64 = 0;
-    let mut size: u64 = 0;
-    let mut token: Option<String> = None;
-    for _ in 0..1000 {
-        let input = ListObjectsV2Input {
-            bucket: bucket.to_owned(),
-            max_keys: Some(1000),
-            continuation_token: token.clone(),
-            ..Default::default()
-        };
-        let out = state.fs.list_objects_v2(state.s3_request(input)).await?.output;
-        for obj in out.contents.unwrap_or_default() {
-            count += 1;
-            size += u64::try_from(obj.size.unwrap_or(0)).unwrap_or(0);
-        }
-        if out.is_truncated == Some(true) {
-            token = out.next_continuation_token;
-            if token.is_none() {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    Ok((count, size))
+    state
+        .fs
+        .bucket_usage(bucket)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to measure bucket `{bucket}`: {e:?}")))
 }
 
 // ---- bucket endpoints ----
