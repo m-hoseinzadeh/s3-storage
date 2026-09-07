@@ -52,6 +52,18 @@ fn normalize_path(path: &Path, delimiter: &str) -> Option<String> {
     Some(normalized)
 }
 
+/// AWS accepts part numbers 1..=10000. Only the upper bound used to be checked, so
+/// a zero or negative number produced an unaddressable `.part--1` file on disk.
+fn check_part_number(part_number: PartNumber) -> S3Result<()> {
+    if !(1..=10_000).contains(&part_number) {
+        return Err(s3_error!(
+            InvalidArgument,
+            "Part number must be an integer between 1 and 10000, inclusive"
+        ));
+    }
+    Ok(())
+}
+
 /// <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Range>
 fn fmt_content_range(start: u64, end_inclusive: u64, size: u64) -> String {
     format!("bytes {start}-{end_inclusive}/{size}")
@@ -848,12 +860,7 @@ impl S3 for FileSystem {
             ..
         } = req.input;
 
-        if part_number > 10_000 {
-            return Err(s3_error!(
-                InvalidArgument,
-                "Part number must be an integer between 1 and 10000, inclusive"
-            ));
-        }
+        check_part_number(part_number)?;
 
         let body = body.ok_or_else(|| s3_error!(IncompleteBody))?;
 
@@ -888,6 +895,7 @@ impl S3 for FileSystem {
 
         let upload_id = Uuid::parse_str(&input.upload_id).map_err(|_| s3_error!(InvalidRequest))?;
         let part_number = input.part_number;
+        check_part_number(part_number)?;
         if self.verify_upload_id(req.credentials.as_ref(), &upload_id).await?.not() {
             return Err(s3_error!(AccessDenied));
         }
@@ -962,14 +970,23 @@ impl S3 for FileSystem {
 
     #[tracing::instrument]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        let S3Request { input, credentials, .. } = req;
         let ListPartsInput {
             bucket, key, upload_id, ..
-        } = req.input;
+        } = input;
+
+        // Every other multipart operation parses the upload id and checks that the
+        // caller owns the session; listing must do the same, or it hands out the
+        // part inventory of someone else's upload.
+        let upload_uuid = Uuid::parse_str(&upload_id).map_err(|_| s3_error!(InvalidRequest))?;
+        if self.verify_upload_id(credentials.as_ref(), &upload_uuid).await?.not() {
+            return Err(s3_error!(AccessDenied));
+        }
 
         let mut parts: Vec<Part> = Vec::new();
         let mut iter = try_!(fs::read_dir(&self.root).await);
 
-        let prefix = format!(".upload_id-{upload_id}");
+        let prefix = format!(".upload_id-{upload_uuid}");
 
         while let Some(entry) = try_!(iter.next_entry().await) {
             let file_type = try_!(entry.file_type().await);
@@ -982,7 +999,9 @@ impl S3 for FileSystem {
 
             let Some(part_segment) = name.strip_prefix(&prefix) else { continue };
             let Some(part_number) = part_segment.strip_prefix(".part-") else { continue };
-            let part_number = part_number.parse::<i32>().unwrap();
+            // A filename is not a parser guarantee: skip anything unreadable rather
+            // than panicking inside the connection task.
+            let Ok(part_number) = part_number.parse::<i32>() else { continue };
 
             let file_meta = try_!(entry.metadata().await);
             let last_modified = Timestamp::from(try_!(file_meta.modified()));
@@ -996,6 +1015,9 @@ impl S3 for FileSystem {
             };
             parts.push(part);
         }
+
+        // `read_dir` order is arbitrary; S3 lists parts in ascending part order.
+        parts.sort_by_key(|p| p.part_number);
 
         let output = ListPartsOutput {
             bucket: Some(bucket),

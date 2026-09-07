@@ -755,3 +755,49 @@ async fn deleting_an_object_clears_its_sidecars() {
     assert_eq!(got.body, b"two");
     assert_eq!(crc(&got), "", "copied object must not inherit the deleted object's checksum");
 }
+
+/// Multipart part handling: bounds on the part number, ownership + id validation on
+/// `ListParts`, and ascending part order regardless of directory order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multipart_part_numbers_and_list_parts() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+
+    let created = request(a, "POST", &host, "/bkt/obj?uploads", None);
+    assert_eq!(created.status, 200);
+    let xml = String::from_utf8_lossy(&created.body).into_owned();
+    let upload_id = xml
+        .split_once("<UploadId>")
+        .and_then(|(_, r)| r.split_once("</UploadId>"))
+        .map(|(id, _)| id.to_owned())
+        .unwrap_or_else(|| panic!("no upload id in {xml}"));
+
+    // Out-of-range part numbers are rejected instead of writing `.part--1` on disk.
+    for bad in ["0", "-1", "10001"] {
+        let path = format!("/bkt/obj?partNumber={bad}&uploadId={upload_id}");
+        let r = request(a, "PUT", &host, &path, Some(b"x"));
+        assert_eq!(r.status, 400, "partNumber={bad} must be rejected");
+    }
+
+    // Upload part 2 before part 1, so directory order cannot be relied on.
+    for (n, body) in [(2u32, &b"second"[..]), (1, &b"first"[..])] {
+        let path = format!("/bkt/obj?partNumber={n}&uploadId={upload_id}");
+        assert_eq!(request(a, "PUT", &host, &path, Some(body)).status, 200);
+    }
+
+    let listed = request(a, "GET", &host, &format!("/bkt/obj?uploadId={upload_id}"), None);
+    assert_eq!(listed.status, 200);
+    let body = String::from_utf8_lossy(&listed.body).into_owned();
+    let first = body.find("<PartNumber>1<").unwrap_or_else(|| panic!("part 1 missing: {body}"));
+    let second = body.find("<PartNumber>2<").unwrap_or_else(|| panic!("part 2 missing: {body}"));
+    assert!(first < second, "parts must be listed ascending: {body}");
+
+    // A malformed upload id is a bad request; an unknown one is denied. Neither may
+    // panic the connection task by trusting a filename it never wrote.
+    let bad_id = request(a, "GET", &host, "/bkt/obj?uploadId=not-a-uuid", None);
+    assert_eq!(bad_id.status, 400);
+    let unknown = request(a, "GET", &host, "/bkt/obj?uploadId=00000000-0000-4000-8000-000000000000", None);
+    assert_eq!(unknown.status, 403);
+}
