@@ -45,7 +45,8 @@ services:
     volumes:
       # Named volume (simple, portable).
       - s3data:/data
-      # Or bind-mount a host directory instead:
+      # Or bind-mount a host directory instead. The container runs as uid 65532,
+      # so chown it first:  mkdir -p ./data && sudo chown 65532:65532 ./data
       # - ./data:/data
     restart: unless-stopped
 

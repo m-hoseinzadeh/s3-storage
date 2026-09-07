@@ -151,7 +151,18 @@ impl S3Route for AdminRoute {
 /// weaker lever than script execution. `frame-ancestors 'none'` is the part that
 /// matters operationally: it stops the panel being framed and clickjacked into
 /// destructive one-click actions like deleting a bucket.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self';      script-src 'self';      style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;      font-src 'self' https://fonts.gstatic.com;      img-src 'self' data:;      connect-src 'self';      form-action 'self';      base-uri 'none';      object-src 'none';      frame-ancestors 'none'";
+const CONTENT_SECURITY_POLICY: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self'; ",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; ",
+    "font-src 'self' https://fonts.gstatic.com; ",
+    "img-src 'self' data:; ",
+    "connect-src 'self'; ",
+    "form-action 'self'; ",
+    "base-uri 'none'; ",
+    "object-src 'none'; ",
+    "frame-ancestors 'none'"
+);
 
 /// Stamp the panel's security headers on every response, SPA and JSON API alike.
 fn apply_security_headers(headers: &mut HeaderMap) {

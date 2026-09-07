@@ -479,7 +479,12 @@ struct CopyBody {
     dst_key: String,
 }
 
-async fn copy_object(state: &AdminState, headers: &HeaderMap, body: Body, remove_source: bool) -> Result<S3Response<Body>, ApiError> {
+async fn copy_object(
+    state: &AdminState,
+    headers: &HeaderMap,
+    body: Body,
+    remove_source: bool,
+) -> Result<S3Response<Body>, ApiError> {
     let c: CopyBody = read_json(headers, body).await?;
     let input = CopyObjectInput::builder()
         .bucket(c.dst_bucket.clone())

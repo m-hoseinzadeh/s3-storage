@@ -30,11 +30,20 @@ COPY src ./src
 COPY --from=ui /ui/dist ./admin-ui/dist
 RUN touch src/main.rs src/lib.rs && cargo build --release --bin s3-storage
 
+# Staged here only so the runtime stage can COPY it in with the right ownership:
+# distroless has no shell, so there is no way to mkdir/chown the data directory
+# there. A fresh named volume inherits this ownership when Docker initialises it
+# from the image.
+RUN mkdir -p /data
+
 # ---- Runtime stage ----
-# distroless/cc provides glibc + libgcc with no shell or package manager.
-FROM gcr.io/distroless/cc-debian12
+# distroless/cc provides glibc + libgcc with no shell or package manager. The
+# `nonroot` variant runs as uid/gid 65532 instead of root, so a container escape
+# does not start out with root on the host side of the namespace.
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /app/target/release/s3-storage /usr/local/bin/s3-storage
+COPY --from=builder --chown=nonroot:nonroot /data /data
 
 # Defaults; override via environment (see README / docker-compose.yml).
 # Three single-purpose ports: API (8080), admin panel (8081), public reads (8082).
@@ -47,5 +56,10 @@ ENV S3_ROOT=/data \
 
 VOLUME ["/data"]
 EXPOSE 8080 8081 8082
+
+# Explicit for the reader; the `nonroot` base already selects this user. A
+# *bind*-mounted host directory keeps its own ownership, so chown it to 65532
+# (`chown 65532:65532 ./data`) or the server cannot write to it.
+USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/s3-storage"]
