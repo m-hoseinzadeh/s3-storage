@@ -1,0 +1,50 @@
+name: Tests
+
+# The Docker workflow only proves the image builds. This runs the actual test
+# suite: unit tests, the admin/API integration tests, and the sync tests (which
+# stand up a second in-process instance of this server as their S3 source, so
+# they need no external service).
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The admin panel is embedded at compile time, so the SPA has to exist
+      # before the crate is built or `rust-embed` has nothing to serve.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: admin-ui/package-lock.json
+      - run: npm ci --prefix admin-ui
+      - run: npm run --prefix admin-ui typecheck
+      - run: npm run --prefix admin-ui build
+
+      # `--locked` matters here: the AWS SDK is held below a version boundary
+      # that the lockfile encodes (see the comments in Cargo.toml), so a silent
+      # dependency bump in CI would defeat the point of the pins.
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      # No `cargo fmt --check` step: this codebase is written to a wider line
+      # budget than rustfmt's default and carries no rustfmt.toml, so the check
+      # would fail on pre-existing code. Reformatting the tree is its own change.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
