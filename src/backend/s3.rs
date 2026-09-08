@@ -1242,11 +1242,23 @@ impl FileSystem {
     /// the directory has to stay -- which matches S3, where a prefix keeps existing
     /// for as long as it has objects beneath it.
     async fn remove_object(&self, bucket: &str, key: &str, path: &Path) -> S3Result<()> {
+        // `a` and `a/` resolve to the same path, so the key's shape and what is
+        // actually on disk can disagree. Deleting the one that is not there is a
+        // no-op, not an error: S3 deletes are idempotent, and treating the mismatch
+        // as a failure meant `DELETE a/` over a file `a` (or `DELETE a` over a
+        // folder placeholder) answered 500 instead.
+        let Ok(meta) = fs::metadata(path).await else { return Ok(()) };
         if key.ends_with('/') {
+            if !meta.is_dir() {
+                return Ok(());
+            }
             let mut dir = try_!(fs::read_dir(path).await);
             if try_!(dir.next_entry().await).is_none() {
                 try_!(fs::remove_dir(path).await);
             }
+            return Ok(());
+        }
+        if meta.is_dir() {
             return Ok(());
         }
         try_!(fs::remove_file(path).await);

@@ -928,3 +928,32 @@ async fn public_reads_forbid_mime_sniffing() {
     assert_eq!(r.status, 200);
     assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
 }
+
+/// `a` and `a/` resolve to the same path, so the key's shape can disagree with what
+/// is on disk. Deleting the one that is not there is a no-op — S3 deletes are
+/// idempotent — not a 500.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_key_whose_shape_mismatches_disk_is_a_no_op() {
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let host = a.to_string();
+    assert_eq!(request(a, "PUT", &host, "/bkt", None).status, 200);
+
+    // A plain object, deleted as though it were a folder placeholder.
+    assert_eq!(request(a, "PUT", &host, "/bkt/file", Some(b"data")).status, 200);
+    assert_eq!(request(a, "DELETE", &host, "/bkt/file/", None).status, 204);
+    let batch = b"<Delete><Object><Key>file/</Key></Object></Delete>";
+    assert_eq!(request(a, "POST", &host, "/bkt?delete", Some(batch)).status, 200);
+    assert_eq!(get(a, "/bkt/file").body, b"data", "the real object must survive");
+
+    // A folder placeholder, deleted as though it were a plain object.
+    assert_eq!(request(a, "PUT", &host, "/bkt/dir/", None).status, 200);
+    assert_eq!(request(a, "DELETE", &host, "/bkt/dir", None).status, 204);
+    let listed = get(a, "/bkt?list-type=2&delimiter=/");
+    assert!(String::from_utf8_lossy(&listed.body).contains("dir/"), "the placeholder must survive");
+
+    // Deleting each with its correct shape does work.
+    assert_eq!(request(a, "DELETE", &host, "/bkt/dir/", None).status, 204);
+    assert_eq!(request(a, "DELETE", &host, "/bkt/file", None).status, 204);
+    assert_eq!(request(a, "DELETE", &host, "/bkt", None).status, 204);
+}
