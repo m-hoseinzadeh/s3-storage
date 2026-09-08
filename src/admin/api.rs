@@ -601,10 +601,26 @@ async fn extract_object(state: &AdminState, headers: &HeaderMap, body: Body) -> 
 
     // A write failure is the more useful diagnosis, so it wins over the send error
     // the inflate task sees once we stop receiving.
+    //
+    // Either way, entries are written as they inflate, so a failure part-way through
+    // leaves what already landed in the bucket. Say so: an operator who is told only
+    // "extraction failed" has no reason to suspect the bucket changed at all. Paths
+    // and declared sizes are vetted up front, so reaching here with `extracted`
+    // non-empty means the archive misreported itself or storage failed mid-write.
+    let partial = |err: ApiError| -> ApiError {
+        if extracted.is_empty() {
+            return err;
+        }
+        ApiError::new(
+            err.status,
+            &err.code,
+            format!("{} (after extracting {} file(s), which remain in the bucket)", err.message, extracted.len()),
+        )
+    };
     if let Some(err) = write_err {
-        return Err(err);
+        return Err(partial(err));
     }
-    if produced.map_err(ApiError::bad_request)? == 0 {
+    if produced.map_err(|e| partial(ApiError::bad_request(e)))? == 0 {
         return Err(ApiError::bad_request("archive contains no files to extract"));
     }
 
@@ -651,17 +667,32 @@ async fn write_zip_entry(
 /// malformed entry, unsafe path, or breach of the size/count caps. A closed `sink`
 /// means the consumer gave up (and will report its own error), so we stop quietly.
 fn decompress_zip(archive: &[u8], dest: &str, sink: &tokio::sync::mpsc::Sender<ZipEntry>) -> Result<usize, String> {
+    decompress_zip_capped(archive, dest, sink, MAX_ENTRIES, MAX_TOTAL_UNCOMPRESSED)
+}
+
+/// [`decompress_zip`] with the caps injected, so they can be exercised in a test
+/// without building a multi-gigabyte fixture.
+fn decompress_zip_capped(
+    archive: &[u8],
+    dest: &str,
+    sink: &tokio::sync::mpsc::Sender<ZipEntry>,
+    max_entries: usize,
+    max_total: u64,
+) -> Result<usize, String> {
     use std::io::Read;
 
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
         .map_err(|e| format!("not a valid ZIP archive: {e}"))?;
-    if zip.len() > MAX_ENTRIES {
-        return Err(format!("archive has too many entries (limit {MAX_ENTRIES})"));
+    if zip.len() > max_entries {
+        return Err(format!("archive has too many entries (limit {max_entries})"));
     }
 
-    // Validate every path before writing anything. Reading names does not inflate,
-    // so this is cheap, and it keeps an archive containing a zip-slip entry from
-    // being partially extracted before the bad entry is reached.
+    // Vet the whole archive before writing anything. Reading the central directory
+    // does not inflate, so this is cheap, and because entries are streamed out as
+    // they inflate, anything caught only part-way through would leave the bucket
+    // half-populated. Checking paths and declared sizes here keeps the common
+    // rejections all-or-nothing.
+    let mut declared: u64 = 0;
     for i in 0..zip.len() {
         let file = zip.by_index(i).map_err(|e| format!("failed to read entry {i}: {e}"))?;
         if file.is_dir() {
@@ -669,6 +700,10 @@ fn decompress_zip(archive: &[u8], dest: &str, sink: &tokio::sync::mpsc::Sender<Z
         }
         if file.enclosed_name().is_none() {
             return Err(format!("archive contains an unsafe path: {}", file.name()));
+        }
+        declared = declared.saturating_add(file.size());
+        if declared > max_total {
+            return Err(format!("extracted size exceeds the {} MiB limit", max_total / (1024 * 1024)));
         }
     }
 
@@ -690,18 +725,15 @@ fn decompress_zip(archive: &[u8], dest: &str, sink: &tokio::sync::mpsc::Sender<Z
             continue;
         }
 
-        // Read at most the remaining budget plus one byte, so an entry whose header
-        // under-reports its size can't slip past the cap.
-        let remaining = MAX_TOTAL_UNCOMPRESSED - total;
+        // Read at most the remaining budget plus one byte. The pass above trusted the
+        // declared sizes; this is the check that holds when they lie.
+        let remaining = max_total - total;
         let mut data = Vec::new();
         file.take(remaining + 1)
             .read_to_end(&mut data)
             .map_err(|e| format!("failed to decompress {rel}: {e}"))?;
         if data.len() as u64 > remaining {
-            return Err(format!(
-                "extracted size exceeds the {} MiB limit",
-                MAX_TOTAL_UNCOMPRESSED / (1024 * 1024)
-            ));
+            return Err(format!("extracted size exceeds the {} MiB limit", max_total / (1024 * 1024)));
         }
         total += data.len() as u64;
         if sink.blocking_send(ZipEntry { name: format!("{dest}{rel}"), data }).is_err() {
@@ -1046,5 +1078,59 @@ fn set_str(headers: &mut HeaderMap, name: header::HeaderName, value: Option<&str
 fn set_cookie(headers: &mut HeaderMap, value: &str) {
     if let Ok(hv) = HeaderValue::from_str(value) {
         headers.insert(header::SET_COOKIE, hv);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut w = zip::ZipWriter::new(&mut buf);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+        buf.into_inner()
+    }
+
+    /// Entries stream out as they inflate, so an archive that busts the size cap has
+    /// to be refused from its declared sizes *before* anything is handed to the
+    /// writer -- otherwise the bucket is left half-populated.
+    #[test]
+    fn oversized_archive_is_refused_before_any_entry_is_emitted() {
+        let archive = zip_of(&[("a.txt", &[b'a'; 400]), ("b.txt", &[b'b'; 400])]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ZipEntry>(8);
+
+        let err = decompress_zip_capped(&archive, "out/", &tx, MAX_ENTRIES, 500).expect_err("must refuse");
+        assert!(err.contains("exceeds"), "{err}");
+        drop(tx);
+        assert!(rx.try_recv().is_err(), "nothing may be emitted when the archive is refused");
+    }
+
+    #[test]
+    fn archive_within_the_cap_streams_every_entry() {
+        let archive = zip_of(&[("a.txt", b"aaa"), ("dir/b.txt", b"bbb")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ZipEntry>(8);
+
+        let produced = decompress_zip_capped(&archive, "out/", &tx, MAX_ENTRIES, 500).expect("must succeed");
+        drop(tx);
+        assert_eq!(produced, 2);
+        let mut names: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).map(|e| e.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["out/a.txt".to_owned(), "out/dir/b.txt".to_owned()]);
+    }
+
+    #[test]
+    fn entry_count_cap_is_enforced() {
+        let archive = zip_of(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ZipEntry>(8);
+        let err = decompress_zip_capped(&archive, "", &tx, 2, MAX_TOTAL_UNCOMPRESSED).expect_err("must refuse");
+        assert!(err.contains("too many entries"), "{err}");
     }
 }

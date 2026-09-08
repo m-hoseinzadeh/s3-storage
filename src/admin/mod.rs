@@ -178,9 +178,9 @@ fn apply_security_headers(headers: &mut HeaderMap) {
 
 /// A JSON error with an HTTP status, rendered as `{ "error": { code, message } }`.
 pub(crate) struct ApiError {
-    status: StatusCode,
-    code: String,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) code: String,
+    pub(crate) message: String,
     /// Seconds for a `Retry-After` header, when the status warrants one.
     retry_after: Option<u64>,
 }
