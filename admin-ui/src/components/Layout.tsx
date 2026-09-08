@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
-import { LayoutDashboard, Database, FolderOpen, Layers, Settings, LogOut, HardDrive } from "lucide-react";
+import { LayoutDashboard, Database, FolderOpen, Layers, Settings, LogOut, HardDrive, DownloadCloud } from "lucide-react";
 import { api } from "../lib/api";
 import { useAuth } from "../context/auth";
 import { Button, cn, useToast } from "./ui";
@@ -9,6 +9,7 @@ const nav = [
   { to: "/buckets", label: "Buckets", icon: Database, end: false },
   { to: "/browse", label: "Object Browser", icon: FolderOpen, end: false },
   { to: "/multipart", label: "Multipart Uploads", icon: Layers, end: false },
+  { to: "/sync", label: "Sync from Remote", icon: DownloadCloud, end: false },
   { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 

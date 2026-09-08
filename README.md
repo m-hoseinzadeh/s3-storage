@@ -32,6 +32,10 @@ custom-domain routing) are this project's own.
   object browser (upload/download/copy/move/metadata/checksums/presigned links),
   and multipart sessions. Served from the same binary, no extra service. See
   [Admin panel](#admin-panel).
+- **Sync from a remote S3/MinIO bucket** — pull an existing bucket into this
+  server from the admin panel, incrementally: re-running copies only what is new
+  or changed, and an interrupted run is safe to re-run. See
+  [Sync from a remote source](#sync-from-a-remote-source).
 - **Docker-first** — small distroless runtime image, one volume at `/data`.
 
 ## Quick start (Docker Compose)
@@ -170,8 +174,9 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   live public/private toggle, a Settings page for domains / custom-domain map /
   public API URL / session lifetime, an object browser (folder navigation, drag-and-drop
   upload, download, byte-range, copy/move/rename, batch delete, folders, metadata
-  editor, checksums, presigned GET/PUT share links), and multipart session
-  management (list parts, abort).
+  editor, checksums, presigned GET/PUT share links), multipart session
+  management (list parts, abort), and a Sync page for pulling a bucket in from a
+  remote S3/MinIO endpoint (see [Sync from a remote source](#sync-from-a-remote-source)).
 - **Extract ZIP archives server-side.** Any `.zip` object shows an *Extract*
   action that unpacks it into individual objects in the same bucket — each file
   becomes its own object, archive folders are preserved as key prefixes, and a
@@ -234,6 +239,59 @@ docker run -d --name s3-storage -p 8080:8080 -p 8081:8081 -p 8082:8082 \
 # then open http://localhost:8081/ and mark buckets public / add domains in the panel
 ```
 
+## Sync from a remote source
+
+The admin panel can pull objects out of an existing MinIO (or any S3-compatible)
+bucket into this server. It is meant for migrating onto `s3-storage`, and for
+keeping a copy topped up afterwards.
+
+Open the panel, go to **Sync from Remote**, and give it the source endpoint,
+credentials, and the bucket to read. **Preview** shows exactly which objects
+would be copied, why, and how many bytes that is, before anything is written.
+
+What it does:
+
+- **Incremental.** A re-run copies only objects that are missing, a different
+  size, or newer on the source; everything else is skipped. The second run over
+  an unchanged bucket copies nothing.
+- **Resumable for free.** Objects are staged to a temporary file and put in place
+  with an atomic rename, so a cancelled or interrupted run leaves only *complete*
+  objects behind — never a truncated one. Re-run it and the rest is copied.
+- **Streaming.** Objects are piped from the source straight to disk, so object
+  size is bounded by your disk, not by memory.
+- **Preserves** content type, content encoding, content disposition, content
+  language, cache control, expiry and user metadata.
+
+Three modes: **New & changed** (the default), **Skip existing** (never replace
+what is already here), and **Overwrite all** (copy everything unconditionally —
+the escape hatch if you suspect the comparison was wrong).
+
+Notes worth knowing:
+
+- **Credentials are never stored.** They are supplied per run and held only for
+  its duration; the panel remembers the endpoint and scope in your browser, but
+  never the secret key. Repeatability comes from the sync being incremental, not
+  from the server keeping a password.
+- **One run at a time.** A second start is refused (`409`) rather than queued —
+  two syncs into one destination would race to write the same key.
+- **A run does not survive a restart**, because it is held in memory. That is
+  safe precisely because re-running resumes; just start it again.
+- **Self-signed or private CA?** Paste the CA certificate into the *Advanced*
+  box on the source card. There is deliberately no "skip certificate
+  verification" switch.
+- **Checksum verification** is opt-in and expensive: it re-reads every local
+  object to hash it. It also cannot verify objects that were uploaded to the
+  source in multiple parts — their ETag is a composite this server cannot
+  reproduce — so those fall back to the size-and-time comparison.
+- **There is no size cap.** A sync will happily fill the disk; use *Preview* to
+  see the byte total first. Neither that nor the object/byte limits substitute
+  for a disk quota.
+
+The same thing is available over the API if you would rather script it:
+`POST /api/sync/preview`, `POST /api/sync/runs`, `GET /api/sync/runs/current`,
+`GET /api/sync/runs`, and `POST /api/sync/runs/{id}/cancel` — all behind the
+panel's session cookie.
+
 ## Client examples
 
 ### Python (boto3)
@@ -295,9 +353,30 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
 cargo test
 ```
 
+> Tests write their data roots under the system temp directory and, following the
+> existing convention in this suite, do not remove them afterwards. Repeated runs
+> accumulate; clear them with `rm -rf ${TMPDIR:-/tmp}/s3-storage-*` if space gets
+> tight.
+
 - `tests/integration.rs` — dependency-free raw-HTTP tests for bucket/object CRUD,
   listing (prefix + delimiter), public/private anonymous access, and custom-domain
   routing.
+- `tests/admin.rs` — the admin panel's JSON API: session auth, object lifecycle,
+  archive extraction, presigned-link round-trips, live settings changes.
+- `tests/sync.rs` — remote sync. Because this server is itself S3-compatible, the
+  "remote MinIO" is a *second* in-process instance of it, so the tests exercise a
+  real SigV4-authenticated S3 endpoint over loopback with no external service.
+  One test in that file additionally runs against a **real** MinIO when you point
+  it at one, and is **skipped** otherwise:
+
+  ```bash
+  MINIO_ENDPOINT=http://127.0.0.1:9000 \
+  MINIO_ACCESS_KEY=... MINIO_SECRET_KEY=... MINIO_BUCKET=some-bucket \
+    cargo test --test sync syncs_from_a_real_minio -- --nocapture
+  ```
+
+  It only reads from the source bucket. Point it at one holding a
+  multipart-uploaded object to cover the composite-ETag case.
 - `tests/boto3_compat.rs` + `tests/smoke_boto3.py` — cross-language SDK
   compatibility via boto3 (full SigV4, streaming upload, multipart). Automatically
   **skipped** if `python3`/`boto3` are not installed.
@@ -307,6 +386,13 @@ cargo test
 This server implements S3 authentication and access control, but like the
 underlying `s3s` adapter it has **no built-in network hardening**. Before exposing
 it to untrusted networks:
+
+- **The admin port is a control plane — never expose it publicly.** Beyond full
+  read/write access to storage, the sync feature makes the *server* open outbound
+  connections to an endpoint the operator supplies, so anyone who reaches the
+  panel can point it at hosts the server can see. The scheme is restricted to
+  `http`/`https` and every run's endpoint is logged, but the real control is
+  keeping the port off untrusted networks.
 
 - **Terminate TLS** at a reverse proxy (nginx/Caddy/Traefik) and forward to it;
   preserve the original `Host` header. SigV4 signs it on the API port, and the

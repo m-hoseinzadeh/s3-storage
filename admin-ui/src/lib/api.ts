@@ -44,6 +44,71 @@ const qs = (params: Record<string, string | number | undefined>) =>
 
 // ---- types ----
 
+// ---- sync from a remote source ----
+
+// Source credentials travel with each request and are never stored server side,
+// so the panel keeps only the non-secret fields (see `Sync.tsx`).
+export interface SyncRequest {
+  endpoint: string;
+  region?: string;
+  access_key: string;
+  secret_key: string;
+  session_token?: string | null;
+  path_style?: boolean;
+  ca_pem?: string | null;
+  src_bucket: string;
+  src_prefix?: string;
+  dst_bucket: string;
+  dst_prefix?: string;
+  mode?: "new_and_changed" | "skip_existing" | "overwrite_all";
+  concurrency?: number;
+  skew_secs?: number;
+  verify_etag?: boolean;
+  create_bucket?: boolean;
+  max_objects?: number | null;
+  max_bytes?: number | null;
+}
+
+export type SyncStatus = "running" | "completed" | "failed" | "cancelled";
+
+export interface SyncJob {
+  id: string;
+  status: SyncStatus;
+  started_unix: number;
+  finished_unix: number | null;
+  source: string;
+  destination: string;
+  listed: number;
+  copied: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
+  current_key: string | null;
+  error: string | null;
+  errors: { key: string; message: string }[];
+  errors_truncated: boolean;
+}
+
+export interface SyncPreviewAction {
+  key: string;
+  dst_key: string;
+  size: number;
+  action: "copy" | "skip";
+  reason: string;
+}
+
+export interface SyncPreview {
+  source: string;
+  destination: string;
+  listed: number;
+  to_copy: number;
+  to_skip: number;
+  bytes_to_copy: number;
+  actions: SyncPreviewAction[];
+  actions_truncated: boolean;
+}
+
+
 export interface ServerConfig {
   access_key: string;
   public_buckets: string[];
@@ -191,6 +256,13 @@ export const api = {
     ),
 
   // multipart
+  syncPreview: (req: SyncRequest) => call<SyncPreview>("/sync/preview", jsonBody(req)),
+  syncStart: (req: SyncRequest) => call<{ job: SyncJob }>("/sync/runs", jsonBody(req)),
+  syncCurrent: () => call<{ job: SyncJob | null }>("/sync/runs/current"),
+  syncHistory: () => call<{ runs: SyncJob[] }>("/sync/runs"),
+  syncCancel: (id: string) =>
+    call<{ ok: boolean; job: SyncJob }>(`/sync/runs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+
   listMultipart: (bucket?: string) => call<{ uploads: UploadSession[] }>(`/multipart?${qs({ bucket: bucket ?? "" })}`),
   listParts: (bucket: string, key: string, upload_id: string) =>
     call<{ parts: PartInfo[] }>(`/multipart/parts?${qs({ bucket, key, upload_id })}`),

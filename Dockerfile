@@ -47,11 +47,19 @@ COPY --from=builder --chown=nonroot:nonroot /data /data
 
 # Defaults; override via environment (see README / docker-compose.yml).
 # Three single-purpose ports: API (8080), admin panel (8081), public reads (8082).
+# The remote-sync client is the only thing here that makes outbound HTTPS
+# connections, and it finds its roots through the platform trust store. The
+# distroless base already sets SSL_CERT_FILE to the bundle it ships; we restate
+# it alongside SSL_CERT_DIR (which the base does not set) so the trust-store
+# location is visible in this file -- there is no shell in the image to go and
+# look, and a miss shows up only as a TLS handshake failure at sync time.
 ENV S3_ROOT=/data \
     S3_HOST=0.0.0.0 \
     S3_PORT=8080 \
     S3_ADMIN_PORT=8081 \
     S3_PUBLIC_PORT=8082 \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_DIR=/etc/ssl/certs \
     RUST_LOG=info
 
 VOLUME ["/data"]

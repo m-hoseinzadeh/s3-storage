@@ -5,6 +5,7 @@
 //! `s3s` DTOs to/from JSON. Uploads/downloads stream straight through the backend.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use hyper::header::{
@@ -16,14 +17,16 @@ use s3s::{Body, S3, S3Request, S3Response};
 use serde::de::DeserializeOwned;
 
 use super::auth::token_from_cookies;
-use super::{ApiError, AdminState, finish, json_ok, presign};
+use super::{ApiError, AdminState, finish, json, json_ok, presign};
 use crate::backend::ObjectAttributes;
 use crate::settings::SettingsUpdate;
+
+use super::sync;
 
 const JSON_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Route an `/api/...` request and always produce a response.
-pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str) -> S3Response<Body> {
+pub(crate) async fn dispatch(state: &Arc<AdminState>, req: S3Request<Body>, rel: &str) -> S3Response<Body> {
     let S3Request { input: body, method, uri, headers, .. } = req;
     let query = query_map(&uri);
     let segs: Vec<&str> = rel.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
@@ -76,6 +79,12 @@ pub(crate) async fn dispatch(state: &AdminState, req: S3Request<Body>, rel: &str
         (&Method::DELETE, ["object"]) => delete_object(state, &query).await,
 
         (&Method::POST, ["folder"]) => create_folder(state, &headers, body).await,
+
+        (&Method::POST, ["sync", "preview"]) => sync_preview(state, &headers, body).await,
+        (&Method::POST, ["sync", "runs"]) => sync_start(state, &headers, body).await,
+        (&Method::GET, ["sync", "runs"]) => Ok(sync_history(state)),
+        (&Method::GET, ["sync", "runs", "current"]) => Ok(sync_current(state)),
+        (&Method::POST, ["sync", "runs", id, "cancel"]) => sync_cancel(state, &dec(id)),
 
         (&Method::GET, ["multipart"]) => list_multipart(state, &query).await,
         (&Method::DELETE, ["multipart"]) => abort_multipart(state, &query).await,
@@ -508,6 +517,96 @@ async fn copy_object(
     Ok(json_ok(serde_json::json!({ "ok": true })))
 }
 
+// ---- sync from a remote source ----
+
+/// Plan a run against a remote source without copying anything.
+async fn sync_preview(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<S3Response<Body>, ApiError> {
+    let req = read_sync_request(state, headers, body).await?;
+    let preview = sync::engine::preview(state, &req)
+        .await
+        .map_err(ApiError::bad_request)?;
+    Ok(json_ok(preview))
+}
+
+/// Start a run. Refused, not queued, while another is in flight: two syncs into
+/// one destination would both see a key as missing and race to write it.
+async fn sync_start(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<S3Response<Body>, ApiError> {
+    let req = read_sync_request(state, headers, body).await?;
+
+    // The conflict carries the running job so the panel can jump straight to it
+    // rather than making the operator go and look for it.
+    let job = match state.sync.try_start(req.source_label(), req.destination_label()) {
+        Ok(job) => job,
+        Err(running) => {
+            let mut resp = json(
+                StatusCode::CONFLICT,
+                &serde_json::json!({
+                    "error": {
+                        "code": "SyncInProgress",
+                        "message": "a sync is already running; cancel it before starting another",
+                    },
+                    "job": running.to_json(),
+                }),
+            );
+            resp.status = Some(StatusCode::CONFLICT);
+            return Ok(resp);
+        }
+    };
+
+    // The run outlives this request, so it gets its own task and its own handle
+    // on the shared state.
+    let spawned = Arc::clone(state);
+    let job_for_task = Arc::clone(&job);
+    tokio::spawn(async move { sync::engine::run(spawned, req, job_for_task).await });
+
+    let mut resp = json_ok(serde_json::json!({ "job": job.to_json() }));
+    resp.status = Some(StatusCode::ACCEPTED);
+    Ok(resp)
+}
+
+fn sync_current(state: &AdminState) -> S3Response<Body> {
+    let job = state.sync.current().map(|j| j.to_json());
+    json_ok(serde_json::json!({ "job": job }))
+}
+
+fn sync_history(state: &AdminState) -> S3Response<Body> {
+    json_ok(serde_json::json!({ "runs": state.sync.history() }))
+}
+
+fn sync_cancel(state: &AdminState, id: &str) -> Result<S3Response<Body>, ApiError> {
+    let job = state
+        .sync
+        .current()
+        .filter(|j| j.id == id)
+        .ok_or_else(|| ApiError::not_found("no such running sync"))?;
+    job.request_cancel();
+    Ok(json_ok(serde_json::json!({ "ok": true, "job": job.to_json() })))
+}
+
+/// Parse and validate a sync request body.
+///
+/// The destination bucket goes through the same `check_bucket` guard as every
+/// other admin write -- without it a name like `.s3-storage` would address the
+/// settings directory.
+async fn read_sync_request(
+    state: &AdminState,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<sync::SyncRequest, ApiError> {
+    let _ = state;
+    let parsed: sync::SyncBody = read_json(headers, body).await?;
+    check_bucket(&parsed.dst_bucket)?;
+    sync::SyncRequest::from_body(parsed).map_err(ApiError::bad_request)
+}
+
 // ---- archive extraction ----
 
 /// Largest compressed archive we will read back from storage into memory (1 GiB).
@@ -747,7 +846,7 @@ fn decompress_zip_capped(
 
 /// Best-effort Content-Type from a file extension, so extracted sites/assets are
 /// served correctly. Unknown extensions fall back to the storage default.
-fn guess_content_type(name: &str) -> Option<String> {
+pub(crate) fn guess_content_type(name: &str) -> Option<String> {
     let (_, ext) = name.rsplit_once('.')?;
     let ct = match ext.to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html",

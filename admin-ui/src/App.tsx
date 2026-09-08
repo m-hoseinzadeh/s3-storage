@@ -8,6 +8,7 @@ import { Buckets } from "./pages/Buckets";
 import { Browser } from "./pages/Browser";
 import { Multipart } from "./pages/Multipart";
 import { Settings } from "./pages/Settings";
+import { Sync } from "./pages/Sync";
 import type { ReactNode } from "react";
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -32,6 +33,7 @@ export function App() {
         <Route path="buckets" element={<Buckets />} />
         <Route path="browse" element={<Browser />} />
         <Route path="multipart" element={<Multipart />} />
+        <Route path="sync" element={<Sync />} />
         <Route path="settings" element={<Settings />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

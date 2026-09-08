@@ -15,6 +15,7 @@ use std::env;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use tokio::fs;
 use tokio::fs::File;
@@ -420,6 +421,35 @@ impl FileSystem {
             }
         }
         Ok((count, size))
+    }
+
+    /// Size and modification time of a stored object, or `None` if we do not
+    /// hold it.
+    ///
+    /// Deliberately a bare `stat`: it does not read the metadata or checksum
+    /// sidecars, and it never hashes the body. The sync planner calls this once
+    /// per source key, so anything more would make an incremental run cost the
+    /// same as a full one. `get_object_path` does the bucket-escape check, so
+    /// this is also safe to call with a key that came off the network.
+    ///
+    /// A key ending in `/` is a folder placeholder, stored as a real directory;
+    /// it reports size 0 so it compares equal to the empty source object.
+    pub(crate) async fn stat_object(&self, bucket: &str, key: &str) -> Result<Option<(u64, SystemTime)>> {
+        let path = self.get_object_path(bucket, key)?;
+        let meta = match fs::metadata(&path).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // A directory only counts as an object when the key says so; otherwise a
+        // key that happens to name a prefix would look like a zero-byte object
+        // and be skipped forever.
+        if meta.is_dir() != key.ends_with('/') {
+            return Ok(None);
+        }
+        let size = if meta.is_dir() { 0 } else { meta.len() };
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        Ok(Some((size, modified)))
     }
 
     /// Write to the filesystem atomically.

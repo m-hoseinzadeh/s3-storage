@@ -13,6 +13,7 @@ mod api;
 mod assets;
 mod auth;
 mod presign;
+mod sync;
 
 use std::sync::Arc;
 
@@ -48,6 +49,10 @@ pub struct AdminState {
     pub(crate) settings: SharedSettings,
     /// Whether `X-Forwarded-Proto` may be believed (see [`Config::trust_proxy`]).
     pub(crate) trust_proxy: bool,
+    /// Registry for the single in-flight "sync from remote" run, plus a short
+    /// history of finished ones. Process-local on purpose: a restart cancels a
+    /// run, and re-running resumes for free (see [`sync`]).
+    pub(crate) sync: sync::SyncManager,
     pub(crate) version: &'static str,
 }
 
@@ -73,6 +78,7 @@ impl AdminState {
             secret_key,
             settings,
             trust_proxy: config.trust_proxy,
+            sync: sync::SyncManager::default(),
             version: env!("CARGO_PKG_VERSION"),
         }
     }
