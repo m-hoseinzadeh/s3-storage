@@ -188,9 +188,11 @@ cargo run -- --root ./data --access-key key --secret-key secret --admin-enabled
   and the API port continues to serve open/unauthenticated.
 
 The frontend source lives in `admin-ui/` (React + Vite + Tailwind). The Docker
-build compiles it automatically; for local `cargo run`/`cargo build` a placeholder
-shell is committed, so run `npm --prefix admin-ui install && npm --prefix admin-ui
-run build` to embed the real UI.
+build compiles it automatically. For a local `cargo run`/`cargo build` only an
+empty `admin-ui/dist/` is committed (a `.gitkeep`, so that rust-embed finds the
+directory and the crate compiles from a fresh clone) — the panel then answers
+"Admin UI is not built" until you run `npm --prefix admin-ui install && npm
+--prefix admin-ui run build` to embed the real UI.
 
 ### docker-compose.yml
 
@@ -307,7 +309,14 @@ underlying `s3s` adapter it has **no built-in network hardening**. Before exposi
 it to untrusted networks:
 
 - **Terminate TLS** at a reverse proxy (nginx/Caddy/Traefik) and forward to it;
-  preserve the original `Host` header (SigV4 signs it).
+  preserve the original `Host` header. SigV4 signs it on the API port, and the
+  admin port compares it against `Origin` to reject cross-site writes — a proxy
+  that rewrites `Host` (to `localhost:8081`, say) will make the panel answer `403`
+  to every write. In nginx: `proxy_set_header Host $host;`.
+- **Set `S3_TRUST_PROXY=true` only once such a proxy is in front**, so
+  `X-Forwarded-Proto` can be believed and the admin session cookie is marked
+  `Secure`. With the server directly reachable, leave it off — any client can send
+  that header.
 - **Limit upload size / disk usage** — object uploads are streamed to disk with no
   size cap; an unauthenticated public bucket or a compromised key could fill the
   volume. Add request-size limits and rate limiting at the proxy, and monitor disk.
