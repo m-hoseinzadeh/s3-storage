@@ -754,35 +754,48 @@ async fn admin_sends_security_headers() {
     }
 }
 
-/// Repeated bad logins must get progressively slower, and a correct login must
-/// clear the streak so a legitimate operator pays the penalty at most once.
+/// Repeated bad logins must be refused, and refused *immediately* rather than held
+/// open: an earlier version slept out the penalty while holding the request, which
+/// throttled guessing but let a flood of attempts pin connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn admin_login_backs_off_after_repeated_failures() {
+async fn admin_login_throttles_after_repeated_failures() {
     let srv = spawn().await;
     let a = srv.addr;
     let bad = br#"{"access_key":"admin-key","secret_key":"wrong"}"#;
 
     // The first few failures are free, so a typo is not punished.
-    let quick = std::time::Instant::now();
-    for _ in 0..3 {
-        assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
+    for i in 0..3 {
+        assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401, "attempt {i}");
     }
-    assert!(quick.elapsed() < std::time::Duration::from_millis(500), "early attempts must not be delayed");
 
-    // Past that the backoff kicks in and compounds.
-    let slow = std::time::Instant::now();
-    for _ in 0..3 {
-        assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
-    }
-    let delayed = slow.elapsed();
-    assert!(delayed >= std::time::Duration::from_millis(500), "guessing must be throttled, took {delayed:?}");
+    // Past that, attempts are refused with a Retry-After instead of being answered.
+    let throttled = request(a, "POST", "/api/login", &[JSON], Some(bad));
+    assert_eq!(throttled.status, 401, "the fourth failure is still answered");
+    let refused = request(a, "POST", "/api/login", &[JSON], Some(bad));
+    assert_eq!(refused.status, 429, "{}", refused.text());
+    assert!(refused.header("retry-after").is_some(), "429 must say when to retry");
 
-    // A correct login still works and resets the streak.
+    // Many attempts at once must all come back promptly -- none may be parked.
+    let start = std::time::Instant::now();
+    let codes: Vec<u16> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| request(a, "POST", "/api/login", &[JSON], Some(bad)).status))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "16 attempts took {elapsed:?}; requests are being parked");
+    assert!(codes.iter().all(|c| *c == 429 || *c == 401), "unexpected codes {codes:?}");
+
+    // A correct login still works once the cooldown lapses, and clears the streak.
+    std::thread::sleep(std::time::Duration::from_millis(1200));
     let cookie = login(a);
     assert!(!cookie.is_empty());
-    let after = std::time::Instant::now();
-    assert_eq!(request(a, "POST", "/api/login", &[JSON], Some(bad)).status, 401);
-    assert!(after.elapsed() < std::time::Duration::from_millis(500), "a success must clear the backoff");
+    assert_eq!(
+        request(a, "POST", "/api/login", &[JSON], Some(bad)).status,
+        401,
+        "a success must clear the streak, so the next failure is free again"
+    );
 }
 
 /// With `--trust-proxy` set, the operator has declared that a TLS-terminating proxy

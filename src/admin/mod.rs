@@ -181,11 +181,13 @@ pub(crate) struct ApiError {
     status: StatusCode,
     code: String,
     message: String,
+    /// Seconds for a `Retry-After` header, when the status warrants one.
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
     pub(crate) fn new(status: StatusCode, code: &str, message: impl Into<String>) -> Self {
-        Self { status, code: code.to_owned(), message: message.into() }
+        Self { status, code: code.to_owned(), message: message.into(), retry_after: None }
     }
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "BadRequest", message)
@@ -200,11 +202,30 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal", message)
     }
 
+    /// A rate-limited request, carrying the `Retry-After` the client should honour.
+    /// Rounded up, so a sub-second cooldown still advertises at least one second.
+    pub(crate) fn too_many_requests(retry_after: std::time::Duration) -> Self {
+        let secs = retry_after.as_secs().max(1);
+        let mut err = Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "TooManyRequests",
+            format!("too many failed login attempts; retry in {secs}s"),
+        );
+        err.retry_after = Some(secs);
+        err
+    }
+
     pub(crate) fn into_response(self) -> S3Response<Body> {
-        json(
+        let mut resp = json(
             self.status,
             &serde_json::json!({ "error": { "code": self.code, "message": self.message } }),
-        )
+        );
+        if let Some(secs) = self.retry_after
+            && let Ok(value) = HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers.insert(hyper::header::RETRY_AFTER, value);
+        }
+        resp
     }
 }
 
@@ -213,7 +234,7 @@ impl From<s3s::S3Error> for ApiError {
         let status = e.status_code().unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let code = e.code().as_str().to_owned();
         let message = e.message().map(ToOwned::to_owned).unwrap_or_else(|| code.clone());
-        Self { status, code, message }
+        Self { status, code, message, retry_after: None }
     }
 }
 

@@ -6,7 +6,7 @@
 //! kept. The signing key is derived from the configured secret key, so tokens
 //! survive restarts but are invalidated if the secret key changes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
@@ -18,66 +18,83 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Failed logins that cost nothing, so an ordinary typo is not punished.
 const FREE_ATTEMPTS: u32 = 3;
-/// Penalty for the first failure past [`FREE_ATTEMPTS`]; it doubles from there.
-const BASE_PENALTY: Duration = Duration::from_millis(250);
-/// Ceiling on the penalty, so a locked-out operator is never stuck for long.
-const MAX_PENALTY: Duration = Duration::from_secs(5);
+/// Cooldown after the first failure past [`FREE_ATTEMPTS`]; it doubles from there.
+const BASE_COOLDOWN: Duration = Duration::from_millis(250);
+/// Ceiling on the cooldown, so a legitimate operator is never locked out for long.
+const MAX_COOLDOWN: Duration = Duration::from_secs(5);
 
-/// Serializing, exponentially backing-off gate on the login endpoint.
+/// Rate limit on the login endpoint.
 ///
-/// Nothing rate-limited login before, so the admin port offered unlimited
-/// guesses at the secret key. Attempts now queue behind a single lock and each
-/// one waits out the penalty earned by the current failure streak, which caps
-/// guessing at roughly one attempt per [`MAX_PENALTY`] no matter how many
-/// requests are made in parallel.
+/// Nothing limited login before, so the admin port offered unlimited guesses at the
+/// secret key, as fast as connections could be opened. Each failure past
+/// [`FREE_ATTEMPTS`] now opens a cooldown -- 250ms, doubling to [`MAX_COOLDOWN`] --
+/// during which further attempts are refused outright, capping guessing at roughly
+/// one attempt per cooldown however many requests arrive in parallel.
 ///
-/// Deliberately a delay rather than a lockout: with a single credential pair a
-/// lockout would let anyone who can reach the port deny the operator access,
-/// trading a brute-force risk for a denial-of-service one. A successful login
-/// clears the streak, so a legitimate operator pays the penalty at most once.
+/// Refused, not delayed: an earlier version held a lock and slept out the penalty,
+/// which throttled guessing but pinned a connection and a task per waiting attempt,
+/// so a flood of attempts tied up the server for as long as it took the queue to
+/// drain. Rejecting immediately with `429` and a `Retry-After` costs the server
+/// nothing per attempt.
+///
+/// Deliberately a cooldown rather than an account lockout: with a single credential
+/// pair there is nobody to fall back to, so a long lockout would let anyone who can
+/// reach the port deny the operator access. A successful login clears the streak.
 #[derive(Debug, Default)]
 pub struct LoginThrottle {
-    /// Consecutive failures. Held across the delay so attempts cannot run in
-    /// parallel to escape it.
-    failures: tokio::sync::Mutex<u32>,
+    state: std::sync::Mutex<ThrottleState>,
+}
+
+#[derive(Debug, Default)]
+struct ThrottleState {
+    /// Consecutive failures.
+    failures: u32,
+    /// When the next attempt may be made; `None` means "right now".
+    next_allowed: Option<Instant>,
 }
 
 impl LoginThrottle {
-    /// Take the login gate, waiting out any penalty owed. The caller must report
-    /// the outcome on the returned guard.
-    pub async fn acquire(&self) -> LoginGate<'_> {
-        let failures = self.failures.lock().await;
-        let penalty = Self::penalty(*failures);
-        if !penalty.is_zero() {
-            tokio::time::sleep(penalty).await;
+    /// Run one login attempt under the rate limit.
+    ///
+    /// `verify` is the credential check. It runs while the lock is held -- it is
+    /// synchronous and constant-time, with nothing to await -- so checking the
+    /// cooldown, verifying, and recording the outcome are one atomic step and
+    /// parallel attempts cannot slip between them.
+    ///
+    /// Returns `Err(retry_after)` when the caller is in a cooldown, otherwise
+    /// `Ok(true)` / `Ok(false)` for the verification result.
+    pub fn attempt(&self, verify: impl FnOnce() -> bool) -> Result<bool, Duration> {
+        // A poisoned lock would mean a panic inside `verify`; recover rather than
+        // wedging the only way in to the panel.
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        if let Some(next) = state.next_allowed
+            && now < next
+        {
+            return Err(next.duration_since(now));
         }
-        LoginGate { failures }
+
+        let ok = verify();
+        if ok {
+            state.failures = 0;
+            state.next_allowed = None;
+        } else {
+            state.failures = state.failures.saturating_add(1);
+            let cooldown = Self::cooldown(state.failures);
+            state.next_allowed = (!cooldown.is_zero()).then(|| now + cooldown);
+        }
+        Ok(ok)
     }
 
-    fn penalty(failures: u32) -> Duration {
+    fn cooldown(failures: u32) -> Duration {
         let Some(over) = failures.checked_sub(FREE_ATTEMPTS) else { return Duration::ZERO };
         if over == 0 {
             return Duration::ZERO;
         }
-        BASE_PENALTY
+        BASE_COOLDOWN
             .checked_mul(1u32.checked_shl(over - 1).unwrap_or(u32::MAX))
-            .unwrap_or(MAX_PENALTY)
-            .min(MAX_PENALTY)
-    }
-}
-
-/// Holds the login gate for the duration of one attempt.
-pub struct LoginGate<'a> {
-    failures: tokio::sync::MutexGuard<'a, u32>,
-}
-
-impl LoginGate<'_> {
-    pub fn succeeded(mut self) {
-        *self.failures = 0;
-    }
-
-    pub fn failed(mut self) {
-        *self.failures = self.failures.saturating_add(1);
+            .unwrap_or(MAX_COOLDOWN)
+            .min(MAX_COOLDOWN)
     }
 }
 
@@ -209,15 +226,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn penalty_is_free_then_doubles_up_to_the_cap() {
+    fn cooldown_is_free_then_doubles_up_to_the_cap() {
         for failures in 0..=FREE_ATTEMPTS {
-            assert_eq!(LoginThrottle::penalty(failures), Duration::ZERO, "{failures} should be free");
+            assert_eq!(LoginThrottle::cooldown(failures), Duration::ZERO, "{failures} should be free");
         }
-        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 1), BASE_PENALTY);
-        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 2), BASE_PENALTY * 2);
-        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 3), BASE_PENALTY * 4);
+        assert_eq!(LoginThrottle::cooldown(FREE_ATTEMPTS + 1), BASE_COOLDOWN);
+        assert_eq!(LoginThrottle::cooldown(FREE_ATTEMPTS + 2), BASE_COOLDOWN * 2);
+        assert_eq!(LoginThrottle::cooldown(FREE_ATTEMPTS + 3), BASE_COOLDOWN * 4);
         // Never past the ceiling, and no overflow however long the streak runs.
-        assert_eq!(LoginThrottle::penalty(FREE_ATTEMPTS + 40), MAX_PENALTY);
-        assert_eq!(LoginThrottle::penalty(u32::MAX), MAX_PENALTY);
+        assert_eq!(LoginThrottle::cooldown(FREE_ATTEMPTS + 40), MAX_COOLDOWN);
+        assert_eq!(LoginThrottle::cooldown(u32::MAX), MAX_COOLDOWN);
+    }
+
+    /// The whole point of refusing rather than delaying: an attempt inside the
+    /// cooldown must return immediately, not block the caller.
+    #[test]
+    fn attempts_inside_the_cooldown_are_refused_without_waiting() {
+        let throttle = LoginThrottle::default();
+        for _ in 0..=FREE_ATTEMPTS {
+            assert_eq!(throttle.attempt(|| false), Ok(false));
+        }
+        let start = Instant::now();
+        let retry = throttle.attempt(|| false).expect_err("must be throttled");
+        assert!(retry <= BASE_COOLDOWN);
+        assert!(start.elapsed() < Duration::from_millis(50), "refusal must not block");
+
+        // A refused attempt never runs `verify`, so it cannot extend its own cooldown.
+        let mut ran = false;
+        let _ = throttle.attempt(|| {
+            ran = true;
+            true
+        });
+        assert!(!ran, "a throttled attempt must not check credentials");
     }
 }
