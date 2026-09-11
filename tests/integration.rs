@@ -324,6 +324,39 @@ async fn list_prefix_and_delimiter_open_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_delimiter_means_no_delimiter() {
+    // `mc` sends `delimiter=` (empty) on every recursive listing, and so do other
+    // clients. Treated literally it is not merely wrong but inverting: `"".find("")`
+    // is Some(0), so every key collapsed into a one-character common prefix and the
+    // listing returned NO objects. A mirror then saw an empty bucket and re-copied
+    // every object on every run.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/emptydelim", None);
+    for key in ["app.js", "theme.css", "nested/deep.txt"] {
+        request(a, "PUT", &a.to_string(), &format!("/emptydelim/{key}"), Some(b"x"));
+    }
+
+    let list = get(a, "/emptydelim?list-type=2&delimiter=");
+    let xml = String::from_utf8_lossy(&list.body);
+    assert!(xml.contains("<Key>app.js</Key>"), "empty delimiter must list objects: {xml}");
+    assert!(xml.contains("<Key>theme.css</Key>"), "empty delimiter must list objects: {xml}");
+    assert!(
+        xml.contains("<Key>nested/deep.txt</Key>"),
+        "empty delimiter must recurse like no delimiter at all: {xml}"
+    );
+    assert!(
+        !xml.contains("<CommonPrefixes>"),
+        "empty delimiter must not group anything into common prefixes: {xml}"
+    );
+
+    // The exact request mc issues, which is what made a mirror re-copy every run.
+    let mc = get(a, "/emptydelim?delimiter=&encoding-type=url&fetch-owner=true&list-type=2&prefix=");
+    let mx = String::from_utf8_lossy(&mc.body);
+    assert!(mx.contains("<Key>app.js</Key>"), "mc-style listing must return objects: {mx}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_objects_v2_paginates_with_continuation_token() {
     let srv = spawn(false, vec![], vec![]).await;
     let a = srv.addr;

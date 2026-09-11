@@ -593,7 +593,14 @@ impl S3 for FileSystem {
             return Err(s3_error!(NoSuchBucket));
         }
 
-        let delimiter = input.delimiter.as_deref();
+        // An empty `delimiter=` means no delimiter, not a zero-length one. Treating it
+        // literally is catastrophic rather than merely wrong: `"".find("")` is
+        // `Some(0)`, so every key "contains" the delimiter at position 0 and collapses
+        // into a one-character common prefix, and the listing returns no objects at
+        // all. `mc` (and other clients) send exactly this on a recursive listing, so
+        // the bucket looked empty to them and a mirror re-copied every object on every
+        // run instead of skipping what was already there.
+        let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
         let prefix = input.prefix.as_deref().unwrap_or("").trim_start_matches('/');
         // AWS caps a page at 1000 keys and reports the effective value back. Without
         // a clamp a caller could ask for a single unbounded page of the whole bucket.
