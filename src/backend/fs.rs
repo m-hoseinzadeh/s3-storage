@@ -273,6 +273,21 @@ impl FileSystem {
         Ok(())
     }
 
+    /// The ETag recorded when the object was written, if there is one.
+    ///
+    /// Listings need an ETag per key and cannot afford `get_md5_sum` for each: that
+    /// would make listing a bucket cost a full read of every object in it. So the
+    /// hash is persisted at write time and simply read back here.
+    ///
+    /// Objects written before it was persisted have no stored ETag and list without
+    /// one, rather than making every listing pay to backfill them; rewriting such an
+    /// object gives it one. Errors are swallowed for the same reason -- a listing
+    /// should not fail because one sidecar is unreadable.
+    pub(crate) async fn load_etag(&self, bucket: &str, key: &str) -> Option<String> {
+        let info = self.load_internal_info(bucket, key).await.ok()??;
+        info.get("etag")?.as_str().map(ToOwned::to_owned)
+    }
+
     /// get md5 sum
     pub(crate) async fn get_md5_sum(&self, bucket: &str, key: &str) -> Result<String> {
         let object_path = self.get_object_path(bucket, key)?;

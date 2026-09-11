@@ -357,6 +357,24 @@ async fn an_empty_delimiter_means_no_delimiter() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_reports_the_etag_of_each_object() {
+    // Sync clients compare the listing's ETag to decide what to re-copy; without one
+    // they cannot tell an unchanged object from a changed one.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/etaglist", None);
+    request(a, "PUT", &a.to_string(), "/etaglist/hello.txt", Some(b"hello"));
+
+    let list = get(a, "/etaglist?list-type=2");
+    let xml = String::from_utf8_lossy(&list.body);
+    // MD5 of "hello".
+    assert!(
+        xml.contains("5d41402abc4b2a76b9719d911017c592"),
+        "listing must carry the object ETag: {xml}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_objects_v2_paginates_with_continuation_token() {
     let srv = spawn(false, vec![], vec![]).await;
     let a = srv.addr;

@@ -250,6 +250,10 @@ impl S3 for FileSystem {
         let file_metadata = try_!(fs::metadata(&src_path).await);
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
 
+        // Hashed from the source, before the copy: the copy writes identical bytes,
+        // and the sidecar write below needs this value.
+        let md5_sum = self.get_md5_sum(bucket, key).await?;
+
         // A copy onto the same path (e.g. a metadata-only `CopyObject` with the same
         // bucket+key) must not touch the data: `fs::copy(p, p)` truncates the file to
         // empty, destroying the object. Skip all data/sidecar copies in that case and
@@ -271,14 +275,13 @@ impl S3 for FileSystem {
             }
 
             // Carry over the checksum sidecar so the copy reports the same checksums,
-            // but drop any stored multipart ETag: the copy is a fresh object whose
-            // ETag is its own MD5, not the source's `<...>-<n>` value.
+            // but replace any stored ETag: the copy is a fresh object whose ETag is
+            // its own MD5, not the source's `<...>-<n>` multipart value. Storing it
+            // rather than removing it keeps the copy listable with an ETag.
             let mut info = self.load_internal_info(bucket, key).await?.unwrap_or_default();
-            info.remove("etag");
+            info.insert("etag".to_owned(), serde_json::Value::String(md5_sum.clone()));
             self.save_internal_info(&input.bucket, &input.key, &info).await?;
         }
-
-        let md5_sum = self.get_md5_sum(bucket, key).await?;
 
         let copy_object_result = CopyObjectResult {
             e_tag: Some(ETag::Strong(md5_sum)),
@@ -615,9 +618,10 @@ impl S3 for FileSystem {
         // Collect matching objects and common prefixes, bounded to this page.
         let mut page = ListingPage::new(resume_after, max_keys_usize);
         if let Some(delimiter) = delimiter {
-            self.list_objects_with_delimiter(&path, prefix, delimiter, &mut page).await?;
+            self.list_objects_with_delimiter(&input.bucket, &path, prefix, delimiter, &mut page)
+                .await?;
         } else {
-            self.list_objects_recursive(&path, prefix, &mut page).await?;
+            self.list_objects_recursive(&input.bucket, &path, prefix, &mut page).await?;
         }
         let (objects, common_prefixes_list) = page.into_sorted();
 
@@ -857,6 +861,11 @@ impl S3 for FileSystem {
 
         let mut info: InternalInfo = default();
         crate::backend::checksum::modify_internal_info(&mut info, &checksum);
+        // Persist the ETag. It is already computed from the bytes streaming past, so
+        // storing it is free here and saves re-reading the whole object to answer a
+        // HEAD later -- and it is the only way a listing can report one without
+        // hashing every object in the bucket.
+        info.insert("etag".to_owned(), serde_json::Value::String(md5_sum.clone()));
         self.save_internal_info(&bucket, &key, &info).await?;
 
         let output = PutObjectOutput {
@@ -1309,7 +1318,13 @@ impl FileSystem {
         Ok(self.get_md5_sum(bucket, key).await?)
     }
 
-    async fn list_objects_recursive(&self, bucket_root: &Path, prefix: &str, page: &mut ListingPage<'_>) -> S3Result<()> {
+    async fn list_objects_recursive(
+        &self,
+        bucket: &str,
+        bucket_root: &Path,
+        prefix: &str,
+        page: &mut ListingPage<'_>,
+    ) -> S3Result<()> {
         let mut dir_queue: VecDeque<PathBuf> = default();
         dir_queue.push_back(bucket_root.to_owned());
         let prefix_is_empty = prefix.is_empty();
@@ -1353,6 +1368,11 @@ impl FileSystem {
                         key: Some(key_str.clone()),
                         last_modified: Some(last_modified),
                         size: Some(try_!(i64::try_from(size))),
+                        // Clients that sync against this server (mc, rclone, aws s3
+                        // sync) compare the listing's ETag to decide what to re-copy.
+                        // Without one they cannot tell an identical object from a
+                        // changed one and re-transfer the whole bucket every run.
+                        e_tag: self.load_etag(bucket, &key_str).await.map(ETag::Strong),
                         ..Default::default()
                     };
                     page.push_object(key_str, object);
@@ -1365,6 +1385,7 @@ impl FileSystem {
 
     async fn list_objects_with_delimiter(
         &self,
+        bucket: &str,
         bucket_root: &Path,
         prefix: &str,
         delimiter: &str,
@@ -1452,6 +1473,9 @@ impl FileSystem {
                             key: Some(key_str.clone()),
                             last_modified: Some(last_modified),
                             size: Some(try_!(i64::try_from(size))),
+                            // See the note in `list_objects_recursive`: without an
+                            // ETag here, syncing clients re-copy everything.
+                            e_tag: self.load_etag(bucket, &key_str).await.map(ETag::Strong),
                             ..Default::default()
                         };
                         page.push_object(key_str, object);
