@@ -26,6 +26,10 @@ const DEFAULT_SESSION_TTL_SECS: u64 = 3600;
 /// Current schema version; bump when adding migrations keyed off `user_version`.
 const SCHEMA_VERSION: i64 = 1;
 
+/// Longest accepted `Cache-Control` value for the public endpoint. Generous for
+/// any real directive list, short enough that the value stays a header.
+const MAX_CACHE_CONTROL_LEN: usize = 200;
+
 /// The settings the admin panel can edit at runtime.
 ///
 /// `Serialize` is used to render the `/api/config` response, not for storage —
@@ -45,6 +49,11 @@ pub struct RuntimeSettings {
     /// Public base URL of the S3 API, used when minting presigned links.
     /// Normalized so a blank value is `None`.
     pub api_public_url: Option<String>,
+    /// `Cache-Control` stamped on successful public reads of objects that carry
+    /// none of their own, e.g. `public, max-age=31536000, immutable`. `None`
+    /// (the default) leaves those responses header-less, which means every CDN
+    /// and browser in front of the endpoint refetches on each request.
+    pub public_cache_control: Option<String>,
     /// Admin session lifetime in seconds.
     pub admin_session_ttl_secs: u64,
 }
@@ -57,6 +66,7 @@ impl Default for RuntimeSettings {
             domain_map: Vec::new(),
             allowed_origins: Vec::new(),
             api_public_url: None,
+            public_cache_control: None,
             admin_session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
         }
     }
@@ -76,6 +86,8 @@ pub struct SettingsUpdate {
     pub allowed_origins: Option<Vec<String>>,
     #[serde(default)]
     pub api_public_url: Option<String>,
+    #[serde(default)]
+    pub public_cache_control: Option<String>,
     #[serde(default)]
     pub admin_session_ttl_secs: Option<u64>,
 }
@@ -109,6 +121,19 @@ impl SettingsUpdate {
         {
             return Err("allowed origins must not be empty".to_owned());
         }
+        if let Some(cc) = &self.public_cache_control {
+            // It is copied verbatim into a response header, so reject anything that
+            // cannot be one here rather than letting it fail silently per request.
+            let cc = cc.trim();
+            if cc.len() > MAX_CACHE_CONTROL_LEN {
+                return Err(format!(
+                    "public cache-control must be at most {MAX_CACHE_CONTROL_LEN} characters"
+                ));
+            }
+            if cc.bytes().any(|b| !(0x20..=0x7e).contains(&b)) {
+                return Err("public cache-control must be printable ASCII on a single line".to_owned());
+            }
+        }
         if self.admin_session_ttl_secs == Some(0) {
             return Err("admin_session_ttl_secs must be greater than 0".to_owned());
         }
@@ -127,6 +152,17 @@ pub struct CorsDecision {
     pub vary: bool,
 }
 
+/// Everything the public endpoint's header layer needs for one request, resolved
+/// in a single snapshot read.
+#[derive(Debug, Clone)]
+pub struct PublicPolicy {
+    /// CORS handling for this request's `Origin`.
+    pub cors: CorsDecision,
+    /// `Cache-Control` to stamp on a successful read whose object declares none.
+    /// `None` leaves the response as the backend produced it.
+    pub cache_control: Option<String>,
+}
+
 /// Derived, read-optimized view rebuilt only when settings change, so per-request
 /// reads never parse strings or allocate maps.
 #[derive(Debug)]
@@ -139,6 +175,8 @@ struct Snapshot {
     allowed_origins: HashSet<String>,
     /// True when `*` is configured: any origin is allowed.
     allow_any_origin: bool,
+    /// Trimmed `public_cache_control`, or `None` when unset or blank.
+    cache_control: Option<String>,
 }
 
 impl Snapshot {
@@ -149,6 +187,12 @@ impl Snapshot {
         let normalized = normalize_origins(&settings.allowed_origins);
         let allow_any_origin = normalized.iter().any(|o| o == "*");
         let allowed_origins = normalized.into_iter().filter(|o| o != "*").collect();
+        let cache_control = settings
+            .public_cache_control
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         Self {
             settings,
             public_set,
@@ -156,6 +200,7 @@ impl Snapshot {
             base_domains_lc,
             allowed_origins,
             allow_any_origin,
+            cache_control,
         }
     }
 }
@@ -199,7 +244,7 @@ impl SettingsStore {
     /// Resolve how a request carrying `origin` (absent for a non-CORS request)
     /// should be answered, in one lock acquisition.
     #[must_use]
-    pub fn cors_decision(&self, origin: Option<&str>) -> CorsDecision {
+    pub fn public_policy(&self, origin: Option<&str>) -> PublicPolicy {
         let snap = self.snapshot.read().unwrap();
         // A non-wildcard allow-list means two requests differing only in `Origin`
         // get different responses, so caches have to key on it -- whether or not
@@ -222,7 +267,10 @@ impl SettingsStore {
                 snap.allowed_origins.contains(origin).then(|| origin.to_owned())
             })
         };
-        CorsDecision { allow_origin, vary }
+        PublicPolicy {
+            cors: CorsDecision { allow_origin, vary },
+            cache_control: snap.cache_control.clone(),
+        }
     }
 
     /// Resolve a host (without port) to a bucket via custom-domain mapping or
@@ -317,6 +365,9 @@ fn load_settings(conn: &Connection) -> rusqlite::Result<RuntimeSettings> {
     let api_public_url = load_kv(conn, "api_public_url")?
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
+    let public_cache_control = load_kv(conn, "public_cache_control")?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
     let admin_session_ttl_secs = load_kv(conn, "admin_session_ttl_secs")?
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -327,6 +378,7 @@ fn load_settings(conn: &Connection) -> rusqlite::Result<RuntimeSettings> {
         domain_map,
         allowed_origins,
         api_public_url,
+        public_cache_control,
         admin_session_ttl_secs,
     })
 }
@@ -365,6 +417,14 @@ fn apply(tx: &rusqlite::Transaction<'_>, upd: &SettingsUpdate) -> rusqlite::Resu
             tx.execute("DELETE FROM settings_kv WHERE key = 'api_public_url'", [])?;
         } else {
             set_kv(tx, "api_public_url", v)?;
+        }
+    }
+    if let Some(cc) = &upd.public_cache_control {
+        let v = cc.trim();
+        if v.is_empty() {
+            tx.execute("DELETE FROM settings_kv WHERE key = 'public_cache_control'", [])?;
+        } else {
+            set_kv(tx, "public_cache_control", v)?;
         }
     }
     if let Some(ttl) = upd.admin_session_ttl_secs {

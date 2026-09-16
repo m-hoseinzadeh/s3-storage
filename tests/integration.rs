@@ -108,6 +108,15 @@ async fn spawn_public(public_buckets: Vec<String>, domain_map: Vec<String>) -> T
 /// Spawn the **public** service wrapped in the [`PublicHeaders`] layer, exactly as
 /// `run()` installs it, with the given allowed-origins list configured.
 async fn spawn_public_cors(public_buckets: Vec<String>, allowed_origins: Vec<String>) -> TestServer {
+    spawn_public_headers(public_buckets, allowed_origins, None).await
+}
+
+/// As [`spawn_public_cors`], plus the public endpoint's default `Cache-Control`.
+async fn spawn_public_headers(
+    public_buckets: Vec<String>,
+    allowed_origins: Vec<String>,
+    cache_control: Option<&str>,
+) -> TestServer {
     use std::sync::Arc;
     let root = unique_dir();
     let config = test_config(root.clone(), true);
@@ -116,6 +125,7 @@ async fn spawn_public_cors(public_buckets: Vec<String>, allowed_origins: Vec<Str
         .update(&SettingsUpdate {
             public_buckets: Some(public_buckets),
             allowed_origins: Some(allowed_origins),
+            public_cache_control: cache_control.map(str::to_owned),
             ..Default::default()
         })
         .unwrap();
@@ -1002,6 +1012,96 @@ async fn cors_allow_list_still_withholds_the_header_without_an_origin() {
     let r = get(a, "/assets/font.woff2");
     assert_eq!(r.status, 200);
     assert_eq!(r.header("access-control-allow-origin"), None);
+}
+
+/// The public endpoint is meant to sit behind a CDN, and an object with no
+/// `Cache-Control` of its own is refetched from origin on every single request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_cache_control_is_stamped_on_reads() {
+    let srv = spawn_public_headers(
+        vec!["assets".to_owned()],
+        vec!["*".to_owned()],
+        Some("public, max-age=31536000, immutable"),
+    )
+    .await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/plain.txt"), b"BYTES").unwrap();
+
+    let r = get(a, "/assets/plain.txt");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("public, max-age=31536000, immutable"));
+
+    // Ranged reads are how a browser pulls a large object, and they must not lose it.
+    let ranged = request_h(a, "GET", &a.to_string(), "/assets/plain.txt", &[("Range", "bytes=0-2")], None);
+    assert_eq!(ranged.status, 206);
+    assert_eq!(ranged.header("cache-control"), Some("public, max-age=31536000, immutable"));
+}
+
+/// Unset is the default, and it must stay a no-op: stamping a `Cache-Control` on a
+/// deployment that never asked for one would pin its objects at every edge in front
+/// of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_cache_control_unset_sends_no_header() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["*".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/plain.txt"), b"BYTES").unwrap();
+
+    assert_eq!(get(a, "/assets/plain.txt").header("cache-control"), None);
+}
+
+/// The object's own `Cache-Control`, set at upload time, is the more specific
+/// statement about that object; the setting is only the default for objects that
+/// say nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_cache_control_never_overrides_the_objects_own() {
+    let srv = spawn_public_headers(
+        vec!["assets".to_owned()],
+        vec!["*".to_owned()],
+        Some("public, max-age=31536000, immutable"),
+    )
+    .await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/cached.txt"), b"BYTES").unwrap();
+    // The attribute sidecar the backend writes on a PUT carrying Cache-Control:
+    // `.bucket-{b64url}.object-{b64url}.metadata.json` at the data root. Spelled out
+    // rather than computed so the test breaks loudly if that layout ever moves.
+    std::fs::write(
+        srv.root.join(".bucket-YXNzZXRz.object-Y2FjaGVkLnR4dA.metadata.json"),
+        br#"{"cache_control":"no-store"}"#,
+    )
+    .unwrap();
+
+    let r = get(a, "/assets/cached.txt");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+}
+
+/// A `Cache-Control` written for immutable object bytes is the wrong answer for a
+/// 403 or a 404: pinning those at the edge turns a briefly-misconfigured bucket
+/// into a long-lived outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_cache_control_is_not_stamped_on_errors() {
+    let srv = spawn_public_headers(
+        vec!["assets".to_owned()],
+        vec!["*".to_owned()],
+        Some("public, max-age=31536000, immutable"),
+    )
+    .await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+
+    let missing = get(a, "/assets/nope.txt");
+    assert!(missing.status >= 400, "expected an error, got {}", missing.status);
+    assert_eq!(missing.header("cache-control"), None);
+
+    // A read of a bucket that is not public is refused, and that refusal must not
+    // be cacheable either.
+    let private = get(a, "/secret/nope.txt");
+    assert!(private.status >= 400, "expected an error, got {}", private.status);
+    assert_eq!(private.header("cache-control"), None);
 }
 
 /// Public buckets serve caller-supplied bytes under a caller-supplied Content-Type,

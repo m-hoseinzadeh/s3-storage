@@ -7,6 +7,10 @@
 //! preflights — whenever the request's `Origin` is permitted by the admin-configured
 //! allow-list ([`SettingsStore::cors_decision`](crate::settings::SettingsStore::cors_decision)).
 //!
+//! It also stamps a configured default `Cache-Control` on successful reads whose
+//! object declares none of its own, so the endpoint is cacheable by the CDN it is
+//! meant to sit behind instead of being refetched from origin on every request.
+//!
 //! It also stamps `X-Content-Type-Options: nosniff`. Public buckets serve
 //! caller-supplied bytes under a caller-supplied `Content-Type`, and without it a
 //! browser may sniff a response into something more dangerous than what was
@@ -22,17 +26,18 @@ use std::pin::Pin;
 use hyper::body::Incoming;
 use hyper::header::{
     HeaderMap, HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS, ORIGIN, VARY,
-    X_CONTENT_TYPE_OPTIONS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS, CACHE_CONTROL,
+    ORIGIN, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::service::Service;
 use hyper::{Method, Request, Response, StatusCode};
 use s3s::{Body, HttpError, HttpResponse};
 
-use crate::settings::{CorsDecision, SharedSettings};
+use crate::settings::{CorsDecision, PublicPolicy, SharedSettings};
 
 /// Wraps an S3-serving service and applies the public endpoint's response-header
-/// policy: CORS from the configured allowed-origins list, plus `nosniff`. The
+/// policy: CORS from the configured allowed-origins list, a default
+/// `Cache-Control`, plus `nosniff`. The
 /// wrapped service must produce an [`HttpResponse`] (which both `s3s::S3Service`
 /// and this wrapper do).
 #[derive(Clone)]
@@ -58,13 +63,13 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<HttpResponse, HttpError>> + Send + 'static>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        // Resolve the CORS handling from the request's `Origin` up front. A `None`
-        // `allow_origin` means the origin is not on the allow-list (or nothing is
-        // allowed at all); we then add no CORS headers and behave exactly as the
+        // Resolve the response-header policy from the request's `Origin` up front. A
+        // `None` `allow_origin` means the origin is not on the allow-list (or nothing
+        // is allowed at all); we then add no CORS headers and behave exactly as the
         // unwrapped service. Under a `*` allow-list it is always `Some`, including
-        // for a request that carries no `Origin` at all -- see `cors_decision`.
+        // for a request that carries no `Origin` at all -- see `public_policy`.
         let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
-        let decision = self.settings.cors_decision(origin);
+        let PublicPolicy { cors: decision, cache_control } = self.settings.public_policy(origin);
 
         // Preflight: answer `OPTIONS` directly. The public S3 backend only permits
         // GET/HEAD and would reject it, so it must be handled here.
@@ -87,7 +92,9 @@ where
         let fut = self.inner.call(req);
         Box::pin(async move {
             let mut resp = fut.await?;
+            let status = resp.status();
             apply_headers(resp.headers_mut(), &decision);
+            apply_cache_control(resp.headers_mut(), status, cache_control.as_deref());
             Ok(resp)
         })
     }
@@ -110,4 +117,22 @@ fn apply_headers(headers: &mut HeaderMap, decision: &CorsDecision) {
     let Some(value) = decision.allow_origin.as_deref() else { return };
     let Ok(header) = HeaderValue::from_str(value) else { return };
     headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, header);
+}
+
+/// Stamp the configured default `Cache-Control` on a successful read.
+///
+/// Only on a 2xx: a `Cache-Control` meant for immutable object bytes is the wrong
+/// answer for a 403 or a 404, and pinning those at the edge turns a
+/// briefly-misconfigured bucket into a long-lived outage.
+///
+/// Never over an object's own value. The S3 layer returns whatever `Cache-Control`
+/// was set at upload time, and that is the more specific statement about *this*
+/// object; the setting is only the default for the objects that say nothing.
+fn apply_cache_control(headers: &mut HeaderMap, status: StatusCode, value: Option<&str>) {
+    let Some(value) = value else { return };
+    if !status.is_success() || headers.contains_key(CACHE_CONTROL) {
+        return;
+    }
+    let Ok(header) = HeaderValue::from_str(value) else { return };
+    headers.insert(CACHE_CONTROL, header);
 }

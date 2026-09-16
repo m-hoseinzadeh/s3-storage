@@ -127,6 +127,11 @@ These deployment-facing settings live in a SQLite database at
   every public read, including requests that carry no `Origin` at all — otherwise a
   CDN or browser cache could store the header-less copy that a plain `<img>` fetch
   produces and replay it to a request that is in CORS mode.
+- **Default Cache-Control** — stamped on successful public reads of objects that
+  carry no `Cache-Control` of their own, e.g. `public, max-age=31536000, immutable`
+  for content-addressed uploads. Blank (the default) sends none, which means every
+  CDN and browser in front of the public port refetches on each request. An object's
+  own value, set at upload time, always wins, and error responses are never stamped.
 - **Public API URL** — the API's public base URL used to mint presigned links.
 - **Admin session lifetime** — how long a login stays valid (applies to new logins).
 

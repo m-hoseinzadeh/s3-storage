@@ -116,19 +116,21 @@ export interface ServerConfig {
   domain_map: string[];
   allowed_origins: string[];
   api_public_url?: string | null;
+  public_cache_control?: string | null;
   admin_session_ttl_secs?: number;
   admin_path: string;
   version: string;
 }
 
-// Partial update; omitted fields are left unchanged. A blank `api_public_url`
-// clears the stored value.
+// Partial update; omitted fields are left unchanged. A blank `api_public_url` or
+// `public_cache_control` clears the stored value.
 export interface SettingsUpdate {
   public_buckets?: string[];
   domains?: string[];
   domain_map?: string[];
   allowed_origins?: string[];
   api_public_url?: string;
+  public_cache_control?: string;
   admin_session_ttl_secs?: number;
 }
 

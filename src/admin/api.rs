@@ -217,6 +217,7 @@ fn config(state: &AdminState) -> S3Response<Body> {
         "domain_map": s.domain_map,
         "allowed_origins": s.allowed_origins,
         "api_public_url": s.api_public_url,
+        "public_cache_control": s.public_cache_control,
         "admin_session_ttl_secs": s.admin_session_ttl_secs,
         "admin_path": "/",
         "version": state.version,

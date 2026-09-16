@@ -15,6 +15,7 @@ export function Settings() {
   const [domains, setDomains] = useState("");
   const [allowedOrigins, setAllowedOrigins] = useState("");
   const [apiUrl, setApiUrl] = useState("");
+  const [cacheControl, setCacheControl] = useState("");
   const [ttl, setTtl] = useState("");
   const [saving, setSaving] = useState(false);
   const toast = useToast();
@@ -24,6 +25,7 @@ export function Settings() {
     setDomains(c.domains.join("\n"));
     setAllowedOrigins(c.allowed_origins.join("\n"));
     setApiUrl(c.api_public_url ?? "");
+    setCacheControl(c.public_cache_control ?? "");
     setTtl(c.admin_session_ttl_secs != null ? String(c.admin_session_ttl_secs) : "");
   }, []);
 
@@ -47,6 +49,7 @@ export function Settings() {
         domains: toLines(domains),
         allowed_origins: toLines(allowedOrigins),
         api_public_url: apiUrl.trim(),
+        public_cache_control: cacheControl.trim(),
         admin_session_ttl_secs: ttlNum,
       });
       toast("success", "Settings saved");
@@ -101,6 +104,15 @@ export function Settings() {
             <div className="mt-4">
               <Field label="Allowed CORS origins (public endpoint)" hint="One per line, e.g. https://app.example.com. Sets Access-Control-Allow-Origin so browsers accept fonts and other cross-origin reads from the public endpoint. Use * to allow any origin. Leave blank to send no CORS headers.">
                 <TextArea value={allowedOrigins} onChange={setAllowedOrigins} placeholder={"https://app.example.com"} rows={4} />
+              </Field>
+            </div>
+            <div className="mt-4">
+              <Field label="Default Cache-Control (public endpoint)" hint="Stamped on successful public reads of objects that carry no Cache-Control of their own. Leave blank to send none — which means every CDN and browser in front of the endpoint refetches on each request.">
+                <Input
+                  value={cacheControl}
+                  onChange={(e) => setCacheControl(e.target.value)}
+                  placeholder="public, max-age=31536000, immutable"
+                />
               </Field>
             </div>
           </Card>
