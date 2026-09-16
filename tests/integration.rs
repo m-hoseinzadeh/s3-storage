@@ -966,6 +966,44 @@ async fn cors_wildcard_does_not_vary() {
     assert_eq!(r.header("vary"), None, "a wildcard answer is identical for every origin");
 }
 
+/// The companion to `cors_wildcard_does_not_vary`: because a wildcard answer omits
+/// `Vary`, it has to be the *same* answer for a request that carries no `Origin` at
+/// all, not just for every origin. A plain `<img>` or `<script>` sends no `Origin`,
+/// so a header-less variant is the one a browser cache or CDN stores first -- and
+/// replaying it to a request that is in CORS mode fails with "No
+/// 'Access-Control-Allow-Origin' header" on a URL that answers curl perfectly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_wildcard_answers_a_request_with_no_origin() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["*".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let r = get(a, "/assets/font.woff2");
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("access-control-allow-origin"),
+        Some("*"),
+        "a cache must not be able to store a header-less copy of a wildcard resource"
+    );
+    assert_eq!(r.header("vary"), None);
+}
+
+/// A non-wildcard allow-list is genuinely origin-dependent, so a request with no
+/// `Origin` still gets no CORS header -- `Vary: Origin` (asserted in
+/// `cors_varies_by_origin_even_when_denied`) is what keeps caches honest there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cors_allow_list_still_withholds_the_header_without_an_origin() {
+    let srv = spawn_public_cors(vec!["assets".to_owned()], vec!["https://ok.example".to_owned()]).await;
+    let a = srv.addr;
+    std::fs::create_dir_all(srv.root.join("assets")).unwrap();
+    std::fs::write(srv.root.join("assets/font.woff2"), b"FONT").unwrap();
+
+    let r = get(a, "/assets/font.woff2");
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("access-control-allow-origin"), None);
+}
+
 /// Public buckets serve caller-supplied bytes under a caller-supplied Content-Type,
 /// so responses must forbid MIME sniffing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

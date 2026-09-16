@@ -59,9 +59,10 @@ where
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         // Resolve the CORS handling from the request's `Origin` up front. A `None`
-        // `allow_origin` means either no `Origin` (a non-CORS request — e.g. the AWS
-        // CLI or curl) or an origin not on the allow-list; in both cases we add no
-        // CORS headers and behave exactly as the unwrapped service.
+        // `allow_origin` means the origin is not on the allow-list (or nothing is
+        // allowed at all); we then add no CORS headers and behave exactly as the
+        // unwrapped service. Under a `*` allow-list it is always `Some`, including
+        // for a request that carries no `Origin` at all -- see `cors_decision`.
         let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
         let decision = self.settings.cors_decision(origin);
 

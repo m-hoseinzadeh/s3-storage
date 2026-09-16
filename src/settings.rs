@@ -120,7 +120,7 @@ impl SettingsUpdate {
 #[derive(Debug, Clone)]
 pub struct CorsDecision {
     /// Value for `Access-Control-Allow-Origin`, or `None` to send no CORS headers
-    /// (no `Origin` on the request, or an origin that is not allowed).
+    /// (the origin is not allowed, or nothing is allowed at all).
     pub allow_origin: Option<String>,
     /// Whether the response content depends on the request's `Origin`, and so must
     /// carry `Vary: Origin` even when no CORS headers are added.
@@ -203,16 +203,25 @@ impl SettingsStore {
         let snap = self.snapshot.read().unwrap();
         // A non-wildcard allow-list means two requests differing only in `Origin`
         // get different responses, so caches have to key on it -- whether or not
-        // *this* origin matched. A wildcard, or no list at all, answers everyone
-        // identically and needs no `Vary`.
+        // *this* origin matched. A wildcard answers everyone identically (see
+        // below) and no list at all answers nobody, so neither needs `Vary`.
         let vary = !snap.allow_any_origin && !snap.allowed_origins.is_empty();
-        let allow_origin = origin.and_then(|origin| {
-            if snap.allow_any_origin {
-                return Some("*".to_owned());
-            }
-            let origin = origin.trim().trim_end_matches('/');
-            snap.allowed_origins.contains(origin).then(|| origin.to_owned())
-        });
+        let allow_origin = if snap.allow_any_origin {
+            // Unconditional, and deliberately NOT gated on the request carrying an
+            // `Origin`: gating it made the response origin-dependent after all,
+            // while `vary` above says it is not. A plain `<img>`/`<script>` fetch
+            // sends no `Origin`, so the header-less variant is exactly the one a
+            // browser cache or CDN stores first -- and it is then replayed to a
+            // request that *is* in CORS mode, which fails with "No
+            // 'Access-Control-Allow-Origin' header" on a URL that answers curl
+            // perfectly. `*` is the same answer for everyone, so just always say it.
+            Some("*".to_owned())
+        } else {
+            origin.and_then(|origin| {
+                let origin = origin.trim().trim_end_matches('/');
+                snap.allowed_origins.contains(origin).then(|| origin.to_owned())
+            })
+        };
         CorsDecision { allow_origin, vary }
     }
 

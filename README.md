@@ -123,7 +123,10 @@ These deployment-facing settings live in a SQLite database at
 - **Allowed CORS origins** — origins (`scheme://host[:port]`, or `*` for any) allowed
   to read from the public port cross-origin. Sets `Access-Control-Allow-Origin` (and
   answers `OPTIONS` preflights) so browsers accept fonts and other CORS-gated
-  subresources; blank means no CORS headers are sent.
+  subresources; blank means no CORS headers are sent. With `*` the header is sent on
+  every public read, including requests that carry no `Origin` at all — otherwise a
+  CDN or browser cache could store the header-less copy that a plain `<img>` fetch
+  produces and replay it to a request that is in CORS mode.
 - **Public API URL** — the API's public base URL used to mint presigned links.
 - **Admin session lifetime** — how long a login stays valid (applies to new logins).
 
