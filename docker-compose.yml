@@ -41,7 +41,24 @@ services:
       #   - the public API URL used to mint presigned links
       #   - the admin session TTL
 
+      # Concurrency (defaults are baked into the image; override here if needed).
+      # S3_MAX_BLOCKING_THREADS caps concurrent file reads across all requests.
+      # S3_LISTEN_BACKLOG is clamped by net.core.somaxconn under `sysctls:` below.
+      # S3_WORKER_THREADS: unset = one per CPU core.
+      S3_MAX_BLOCKING_THREADS: ${S3_MAX_BLOCKING_THREADS:-1024}
+      S3_LISTEN_BACKLOG: ${S3_LISTEN_BACKLOG:-4096}
+
       RUST_LOG: ${RUST_LOG:-info}
+    # Kernel limits are per container, so they live here rather than in the image.
+    ulimits:
+      # Each download holds a socket and an open file.
+      nofile:
+        soft: 65536
+        hard: 65536
+    sysctls:
+      # Accept-queue cap; keep >= S3_LISTEN_BACKLOG. Per network namespace, so
+      # settable here without touching the host.
+      net.core.somaxconn: 4096
     volumes:
       # Named volume (simple, portable).
       - s3data:/data

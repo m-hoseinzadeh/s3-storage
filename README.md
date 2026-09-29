@@ -95,6 +95,9 @@ lifetime) is managed in the admin panel and persisted in a SQLite database; see
 | `S3_ACCESS_KEY`     | `--access-key`    | —         | SigV4 access key (set with the secret). |
 | `S3_SECRET_KEY`     | `--secret-key`    | —         | SigV4 secret key (set with the access key). |
 | `S3_ADMIN_ENABLED`  | `--admin-enabled` | `false`   | Enable the embedded web admin panel (requires credentials). |
+| `S3_WORKER_THREADS` | `--worker-threads` | CPU cores | Async threads handling requests. |
+| `S3_MAX_BLOCKING_THREADS` | `--max-blocking-threads` | `512` (image: `1024`) | Cap on threads doing file I/O, i.e. on concurrent file reads across all requests. |
+| `S3_LISTEN_BACKLOG` | `--listen-backlog` | `1024` (image: `4096`) | Accept queue per listener; the kernel clamps it to `net.core.somaxconn` (set in `docker-compose.yml`). |
 
 Notes:
 - If `S3_ACCESS_KEY`/`S3_SECRET_KEY` are **unset**, the API port runs fully open and

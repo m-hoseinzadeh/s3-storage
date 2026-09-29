@@ -48,6 +48,9 @@ async fn boto3_sdk_compatibility() {
         admin_enabled: false,
         admin_port: 0,
         trust_proxy: false,
+        worker_threads: None,
+        max_blocking_threads: None,
+        listen_backlog: 1024,
     };
 
     let settings = SettingsStore::open(&root).unwrap();

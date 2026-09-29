@@ -53,11 +53,20 @@ COPY --from=builder --chown=nonroot:nonroot /data /data
 # it alongside SSL_CERT_DIR (which the base does not set) so the trust-store
 # location is visible in this file -- there is no shell in the image to go and
 # look, and a miss shows up only as a TLS handshake failure at sync time.
+#
+# Concurrency: every file read runs on a blocking-pool thread, so
+# S3_MAX_BLOCKING_THREADS caps how many downloads can be reading at once (tokio's
+# own default is 512). S3_LISTEN_BACKLOG only takes effect up to the kernel's
+# `net.core.somaxconn`, which the image cannot set -- it is per container, see the
+# `sysctls:` in docker-compose.yml. S3_WORKER_THREADS is left unset: one per CPU
+# core, as the container sees them.
 ENV S3_ROOT=/data \
     S3_HOST=0.0.0.0 \
     S3_PORT=8080 \
     S3_ADMIN_PORT=8081 \
     S3_PUBLIC_PORT=8082 \
+    S3_MAX_BLOCKING_THREADS=1024 \
+    S3_LISTEN_BACKLOG=4096 \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_DIR=/etc/ssl/certs \
     RUST_LOG=info

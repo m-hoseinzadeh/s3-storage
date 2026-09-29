@@ -66,6 +66,9 @@ fn admin_config_with(root: PathBuf, trust_proxy: bool) -> Config {
         admin_enabled: true,
         admin_port: 0,
         trust_proxy,
+        worker_threads: None,
+        max_blocking_threads: None,
+        listen_backlog: 1024,
     }
 }
 

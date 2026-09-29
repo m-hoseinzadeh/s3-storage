@@ -49,6 +49,9 @@ fn config(root: PathBuf, access: &str, secret: &str) -> Config {
         admin_enabled: true,
         admin_port: 0,
         trust_proxy: false,
+        worker_threads: None,
+        max_blocking_threads: None,
+        listen_backlog: 1024,
     }
 }
 

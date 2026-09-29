@@ -53,6 +53,9 @@ fn test_config(root: PathBuf, auth: bool) -> Config {
         admin_enabled: false,
         admin_port: 0,
         trust_proxy: false,
+        worker_threads: None,
+        max_blocking_threads: None,
+        listen_backlog: 1024,
     }
 }
 

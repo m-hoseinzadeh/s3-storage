@@ -57,6 +57,24 @@ pub struct Config {
     /// `Secure`.
     #[arg(long, env = "S3_TRUST_PROXY", default_value_t = false)]
     pub trust_proxy: bool,
+
+    /// Async worker threads, which run all request handling except file I/O.
+    /// Unset means one per CPU core, which rarely needs changing.
+    #[arg(long, env = "S3_WORKER_THREADS", value_parser = clap::value_parser!(u16).range(1..))]
+    pub worker_threads: Option<u16>,
+
+    /// Upper bound on threads doing file I/O. Every file read, write and `stat`
+    /// runs on one, so this caps how many can be in flight at once across all
+    /// requests; raise it on fast disks under many concurrent downloads. Unset
+    /// means tokio's default, 512. Idle threads exit after a few seconds.
+    #[arg(long, env = "S3_MAX_BLOCKING_THREADS", value_parser = clap::value_parser!(u16).range(1..))]
+    pub max_blocking_threads: Option<u16>,
+
+    /// Accept-queue length for each listener: connections the kernel holds
+    /// while the server is busy accepting. Clamped by the kernel to
+    /// `net.core.somaxconn`, so raise that as well.
+    #[arg(long, env = "S3_LISTEN_BACKLOG", default_value_t = 1024, value_parser = clap::value_parser!(u32).range(1..))]
+    pub listen_backlog: u32,
 }
 
 impl Config {

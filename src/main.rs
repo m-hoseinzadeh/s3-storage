@@ -37,7 +37,15 @@ fn main() -> ExitCode {
         }
     }
 
-    let runtime = match tokio::runtime::Runtime::new() {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if let Some(n) = config.worker_threads {
+        runtime.worker_threads(n.into());
+    }
+    if let Some(n) = config.max_blocking_threads {
+        runtime.max_blocking_threads(n.into());
+    }
+    let runtime = match runtime.build() {
         Ok(rt) => rt,
         Err(err) => {
             eprintln!("error: failed to start tokio runtime: {err}");

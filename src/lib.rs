@@ -24,7 +24,7 @@ use hyper::Request;
 use s3s::auth::SimpleAuth;
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{HttpError, HttpResponse};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -163,6 +163,24 @@ where
     Ok(())
 }
 
+/// Bind a listener with an explicit accept backlog. `TcpListener::bind` always
+/// asks for 1024, which caps the queue however high `net.core.somaxconn` is set.
+async fn bind(host: &str, port: u16, backlog: u32) -> io::Result<TcpListener> {
+    let mut last_err = None;
+    for addr in tokio::net::lookup_host((host, port)).await? {
+        let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+        // As `TcpListener::bind` does, so a restart can rebind while old
+        // connections sit in TIME_WAIT.
+        #[cfg(unix)]
+        socket.set_reuseaddr(true)?;
+        match socket.bind(addr).and_then(|()| socket.listen(backlog)) {
+            Ok(listener) => return Ok(listener),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "could not resolve to any address")))
+}
+
 /// Run the server from a [`Config`], shutting down on Ctrl-C.
 ///
 /// Three single-purpose listeners share one backend: the authenticated S3 API
@@ -173,7 +191,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     let settings = SettingsStore::open(fs.root())?;
 
     let api = build_api_service(&config, Arc::clone(&fs), &settings);
-    let api_listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
+    let api_listener = bind(&config.host, config.port, config.listen_backlog).await?;
     info!("API listening on http://{}", api_listener.local_addr()?);
 
     // The public endpoint is wrapped in its response-header layer: the configured
@@ -183,7 +201,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         build_public_service(&config, Arc::clone(&fs), &settings),
         Arc::clone(&settings),
     );
-    let public_listener = TcpListener::bind((config.host.as_str(), config.public_port)).await?;
+    let public_listener = bind(&config.host, config.public_port, config.listen_backlog).await?;
     info!("public endpoint listening on http://{}", public_listener.local_addr()?);
 
     // One shutdown signal fanned out to every listener; each waits on its own clone.
@@ -202,7 +220,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     info!("data root: {}", config.root.display());
 
     let admin_listener = if config.admin_active() {
-        let listener = TcpListener::bind((config.host.as_str(), config.admin_port)).await?;
+        let listener = bind(&config.host, config.admin_port, config.listen_backlog).await?;
         info!("admin panel listening on http://{}", listener.local_addr()?);
         Some(listener)
     } else {
@@ -230,4 +248,35 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::Parser;
+
+    #[tokio::test]
+    async fn bind_listens_with_the_requested_backlog_and_resolves_names() {
+        for host in ["127.0.0.1", "localhost"] {
+            let listener = bind(host, 0, 4096).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+            client.unwrap();
+            accepted.unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrency_options_parse_and_reject_zero() {
+        let config = Config::try_parse_from(["s3-storage", "--max-blocking-threads", "2048", "--listen-backlog", "8192"])
+            .unwrap();
+        assert_eq!(config.max_blocking_threads, Some(2048));
+        assert_eq!(config.listen_backlog, 8192);
+        assert_eq!(config.worker_threads, None);
+        // tokio panics on a zero-sized pool; refuse it at startup instead.
+        for flag in ["--worker-threads", "--max-blocking-threads", "--listen-backlog"] {
+            assert!(Config::try_parse_from(["s3-storage", flag, "0"]).is_err(), "{flag} 0");
+        }
+    }
 }
