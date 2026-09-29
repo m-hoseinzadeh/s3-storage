@@ -4,6 +4,7 @@
 
 use crate::backend::fs::FileSystem;
 use crate::backend::fs::InternalInfo;
+use crate::backend::fs::{ETAG_STAMP, etag_stamp, stored_etag};
 use crate::backend::utils::*;
 
 use s3s::S3;
@@ -51,6 +52,15 @@ fn normalize_path(path: &Path, delimiter: &str) -> Option<String> {
     }
     Some(normalized)
 }
+
+/// Read size when streaming an object's bytes out.
+///
+/// Every read on a `tokio::fs::File` is a separate trip through the blocking
+/// thread pool, so this sets how many trips a download costs. At the old 4 KiB a
+/// 100 MB object took ~25,000 of them, and under concurrent downloads the pool
+/// saturated and every other file operation queued behind it. tokio caps a
+/// single file read at 2 MiB, so this stays well inside what one read can fill.
+const READ_CHUNK: usize = 256 * 1024;
 
 /// AWS caps a `ListObjects` page at 1000 keys; so do we, for requested and default
 /// page sizes alike.
@@ -209,7 +219,7 @@ fn evaluate_preconditions(
 
 #[async_trait::async_trait]
 impl S3 for FileSystem {
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
@@ -224,7 +234,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
         let (bucket, key) = match input.copy_source {
@@ -278,8 +288,17 @@ impl S3 for FileSystem {
             // but replace any stored ETag: the copy is a fresh object whose ETag is
             // its own MD5, not the source's `<...>-<n>` multipart value. Storing it
             // rather than removing it keeps the copy listable with an ETag.
-            let mut info = self.load_internal_info(bucket, key).await?.unwrap_or_default();
+            // A source sidecar stamped for other bytes describes another object, so
+            // its checksums must not be carried over (see `resolve_etag`).
+            let mut info = self
+                .load_internal_info(bucket, key)
+                .await?
+                .filter(|i| !i.contains_key(ETAG_STAMP) || stored_etag(i, &file_metadata).is_some())
+                .unwrap_or_default();
             info.insert("etag".to_owned(), serde_json::Value::String(md5_sum.clone()));
+            // The source's stamp names the source file; the copy is a new file, and
+            // its ETag here was computed from the bytes, so it needs none.
+            info.remove(ETAG_STAMP);
             self.save_internal_info(&input.bucket, &input.key, &info).await?;
         }
 
@@ -296,7 +315,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
@@ -314,7 +333,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(DeleteBucketOutput {}))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
         let bucket_root = self.get_bucket_path(&input.bucket)?;
@@ -328,7 +347,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
         let input = req.input;
         // In quiet mode the response carries only keys whose deletion failed; the
@@ -361,7 +380,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn get_bucket_location(&self, req: S3Request<GetBucketLocationInput>) -> S3Result<S3Response<GetBucketLocationOutput>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
@@ -374,7 +393,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         let object_path = self.get_object_path(&input.bucket, &input.key)?;
@@ -389,11 +408,13 @@ impl S3 for FileSystem {
         // present, otherwise the whole-object MD5. Loading the sidecar up front also
         // avoids hashing a (possibly huge) multipart object just to answer a
         // conditional request.
-        let info = self.load_internal_info(&input.bucket, &input.key).await?;
-        let etag = match info.as_ref().and_then(|i| i.get("etag")).and_then(|v| v.as_str()) {
-            Some(e) => e.to_owned(),
-            None => self.get_md5_sum(&input.bucket, &input.key).await?,
-        };
+        // Both sidecars are needed on the common (200) path, and each read is a
+        // round trip through the blocking pool; do them side by side.
+        let (mut info, obj_attrs) = tokio::try_join!(
+            self.load_internal_info(&input.bucket, &input.key),
+            self.load_object_attributes(&input.bucket, &input.key, None),
+        )?;
+        let etag = self.resolve_etag(&input.bucket, &input.key, &file_metadata, &mut info).await?;
 
         // Honour conditional-request headers before streaming any bytes.
         match evaluate_preconditions(
@@ -431,9 +452,7 @@ impl S3 for FileSystem {
             None => {}
         }
 
-        let body = bytes_stream(ReaderStream::with_capacity(file, 4096), content_length_usize);
-
-        let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
+        let body = bytes_stream(ReaderStream::with_capacity(file, READ_CHUNK), content_length_usize);
 
         let checksum = match &info {
             // S3 skips returning the checksum if a range is specified that is
@@ -467,7 +486,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
@@ -479,22 +498,26 @@ impl S3 for FileSystem {
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug", skip_all, fields(bucket = %req.input.bucket, key = %req.input.key))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
         let path = self.get_object_path(&input.bucket, &input.key)?;
 
-        if !path.exists() {
-            return Err(s3_error!(NoSuchKey));
-        }
-
-        let file_metadata = try_!(fs::metadata(path).await);
+        let file_metadata = match fs::metadata(path).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(s3_error!(NoSuchKey)),
+            result => try_!(result),
+        };
         let last_modified = Timestamp::from(try_!(file_metadata.modified()));
         let file_len = file_metadata.len();
 
         // S3 returns the ETag on HEAD, so always resolve it (stored multipart ETag or
         // whole-object MD5) and use it for any conditional headers too.
-        let etag_str = self.object_etag(&input.bucket, &input.key).await?;
+        // As in `get_object`: both sidecars, side by side.
+        let (mut info, obj_attrs) = tokio::try_join!(
+            self.load_internal_info(&input.bucket, &input.key),
+            self.load_object_attributes(&input.bucket, &input.key, None),
+        )?;
+        let etag_str = self.resolve_etag(&input.bucket, &input.key, &file_metadata, &mut info).await?;
         match evaluate_preconditions(
             input.if_match.as_ref(),
             input.if_none_match.as_ref(),
@@ -507,8 +530,6 @@ impl S3 for FileSystem {
             Precondition::Proceed => {}
         }
         let etag = Some(ETag::Strong(etag_str));
-
-        let obj_attrs = self.load_object_attributes(&input.bucket, &input.key, None).await?;
 
         #[allow(clippy::redundant_closure_for_method_calls)]
         let output = HeadObjectOutput {
@@ -528,7 +549,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn list_buckets(&self, _: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         let mut buckets: Vec<Bucket> = Vec::new();
         let mut iter = try_!(fs::read_dir(&self.root).await);
@@ -566,7 +587,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let v2_resp = self.list_objects_v2(req.map_input(Into::into)).await?;
 
@@ -587,7 +608,7 @@ impl S3 for FileSystem {
         }))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
         let input = req.input;
         let path = self.get_bucket_path(&input.bucket)?;
@@ -694,7 +715,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         use crate::backend::fs::ObjectAttributes;
 
@@ -880,7 +901,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn create_multipart_upload(
         &self,
         req: S3Request<CreateMultipartUploadInput>,
@@ -915,7 +936,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         let UploadPartInput {
             body,
@@ -953,7 +974,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let input = req.input;
 
@@ -1008,7 +1029,7 @@ impl S3 for FileSystem {
         let content_length_usize = try_!(usize::try_from(content_length));
 
         let _ = try_!(src_file.seek(io::SeekFrom::Start(start)).await);
-        let body = StreamingBlob::wrap(bytes_stream(ReaderStream::with_capacity(src_file, 4096), content_length_usize));
+        let body = StreamingBlob::wrap(bytes_stream(ReaderStream::with_capacity(src_file, READ_CHUNK), content_length_usize));
 
         let mut md5_hash = Md5::new();
         let stream = body.inspect_ok(|bytes| md5_hash.update(bytes.as_ref()));
@@ -1032,7 +1053,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
         let S3Request { input, credentials, .. } = req;
         let ListPartsInput {
@@ -1093,7 +1114,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn complete_multipart_upload(
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
@@ -1205,7 +1226,7 @@ impl S3 for FileSystem {
         Ok(S3Response::new(output))
     }
 
-    #[tracing::instrument]
+    #[tracing::instrument(level = "debug")]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
@@ -1309,13 +1330,83 @@ impl FileSystem {
 
     /// The ETag to advertise for an object: the stored multipart ETag
     /// (`<md5-of-part-md5s>-<n>`) when present, otherwise the whole-object MD5.
-    async fn object_etag(&self, bucket: &str, key: &str) -> S3Result<String> {
-        if let Some(info) = self.load_internal_info(bucket, key).await?
-            && let Some(etag) = info.get("etag").and_then(|v| v.as_str())
-        {
-            return Ok(etag.to_owned());
+    async fn object_etag(&self, bucket: &str, key: &str, meta: &std::fs::Metadata) -> S3Result<String> {
+        let mut info = self.load_internal_info(bucket, key).await?;
+        self.resolve_etag(bucket, key, meta, &mut info).await
+    }
+
+    /// The object's whole-body MD5: its stored ETag when that is one, and a fresh
+    /// hash only for a multipart ETag (`<md5-of-part-md5s>-<n>`, which is not the
+    /// body's MD5). For callers that must compare against another server's MD5.
+    pub(crate) async fn object_md5(&self, bucket: &str, key: &str) -> S3Result<String> {
+        let path = self.get_object_path(bucket, key)?;
+        let meta = try_!(fs::metadata(&path).await);
+        let etag = self.object_etag(bucket, key, &meta).await?;
+        if etag.contains('-') {
+            return Ok(self.get_md5_sum(bucket, key).await?);
         }
-        Ok(self.get_md5_sum(bucket, key).await?)
+        Ok(etag)
+    }
+
+    /// The ETag from an already-loaded `info` sidecar, computing and persisting it
+    /// when the sidecar has none. `meta` describes the object file being served.
+    ///
+    /// Objects written before ETags were stored have no `etag`, and hashing them
+    /// means reading the whole file -- before a GET can send its first byte, and
+    /// for a HEAD that reads no body at all. Doing that on every request doubled
+    /// the disk traffic of serving such objects, so the hash is written back and
+    /// paid once.
+    ///
+    /// The write-back carries an [`ETAG_STAMP`] of the bytes it was computed from.
+    /// It cannot be made atomic against a concurrent upload of the same key, which
+    /// may land between the hash and the write and have its fresh sidecar replaced
+    /// by this stale one. A stamp that does not match the file being served marks
+    /// exactly that: the whole sidecar (checksums included) describes other bytes,
+    /// so it is dropped here and rebuilt, rather than served. A failed write-back
+    /// is ignored: it only means the next request hashes again.
+    async fn resolve_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        meta: &std::fs::Metadata,
+        info: &mut Option<InternalInfo>,
+    ) -> S3Result<String> {
+        if let Some(i) = info.as_ref() {
+            if let Some(etag) = stored_etag(i, meta) {
+                return Ok(etag.to_owned());
+            }
+            if i.contains_key(ETAG_STAMP) {
+                *info = None;
+            }
+        }
+
+        // One hash per object at a time. Right after a deploy, a popular object
+        // without a stored ETag is requested by many clients at once, and each
+        // would otherwise read the whole file just to compute the same value.
+        // Whoever waited re-reads the sidecar the first one wrote.
+        let path = self.get_object_path(bucket, key)?;
+        let _guard = self.etag_locks.lock(&path).await;
+        if let Some(fresh) = self.load_internal_info(bucket, key).await?
+            && let Some(etag) = stored_etag(&fresh, meta)
+        {
+            let etag = etag.to_owned();
+            *info = Some(fresh);
+            return Ok(etag);
+        }
+
+        let stamp = etag_stamp(meta);
+        let etag = self.get_md5_sum(bucket, key).await?;
+        // `get_md5_sum` opens the path afresh; only store the result if that was
+        // still the file `meta` describes.
+        if fs::metadata(&path).await.is_ok_and(|m| etag_stamp(&m) == stamp) {
+            let info = info.get_or_insert_default();
+            info.insert("etag".to_owned(), serde_json::Value::String(etag.clone()));
+            info.insert(ETAG_STAMP.to_owned(), serde_json::Value::String(stamp));
+            if let Err(err) = self.save_internal_info(bucket, key, info).await {
+                debug!(bucket, key, ?err, "failed to persist computed etag");
+            }
+        }
+        Ok(etag)
     }
 
     async fn list_objects_recursive(
@@ -1372,7 +1463,7 @@ impl FileSystem {
                         // sync) compare the listing's ETag to decide what to re-copy.
                         // Without one they cannot tell an identical object from a
                         // changed one and re-transfer the whole bucket every run.
-                        e_tag: self.load_etag(bucket, &key_str).await.map(ETag::Strong),
+                        e_tag: self.load_etag(bucket, &key_str, &metadata).await.map(ETag::Strong),
                         ..Default::default()
                     };
                     page.push_object(key_str, object);
@@ -1475,7 +1566,7 @@ impl FileSystem {
                             size: Some(try_!(i64::try_from(size))),
                             // See the note in `list_objects_recursive`: without an
                             // ETag here, syncing clients re-copy everything.
-                            e_tag: self.load_etag(bucket, &key_str).await.map(ETag::Strong),
+                            e_tag: self.load_etag(bucket, &key_str, &metadata).await.map(ETag::Strong),
                             ..Default::default()
                         };
                         page.push_object(key_str, object);

@@ -384,6 +384,112 @@ async fn a_listing_reports_the_etag_of_each_object() {
     );
 }
 
+/// The object's `.internal.json` sidecar under the data root, if there is one.
+fn internal_sidecar(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root).unwrap().map(|e| e.unwrap().path()).find(|p| {
+        let name = p.file_name().unwrap().to_string_lossy();
+        name.starts_with(".bucket-") && name.ends_with(".internal.json")
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_etag_is_computed_once_and_stored() {
+    // Objects written before ETags were persisted have no stored one. Hashing them
+    // on every GET/HEAD read the whole file per request, so the first read now
+    // stores it for the rest.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/legacy", None);
+    request(a, "PUT", &a.to_string(), "/legacy/hello.txt", Some(b"hello"));
+    let md5 = "\"5d41402abc4b2a76b9719d911017c592\"";
+
+    for method in ["GET", "HEAD"] {
+        let sidecar = internal_sidecar(&srv.root).expect("PUT must write a sidecar");
+        std::fs::remove_file(&sidecar).unwrap();
+
+        let resp = request(a, method, &a.to_string(), "/legacy/hello.txt", None);
+        assert_eq!(resp.status, 200, "{method}");
+        assert_eq!(resp.header("etag"), Some(md5), "{method}");
+
+        let stored = std::fs::read_to_string(&sidecar).unwrap_or_else(|_| panic!("{method} must store the ETag"));
+        assert!(stored.contains("5d41402abc4b2a76b9719d911017c592"), "{method}: {stored}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_reads_of_an_object_without_an_etag_agree() {
+    // Many clients reading a legacy object at once share a single backfill; the
+    // ones that waited must still answer with the right ETag.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/herd", None);
+    request(a, "PUT", &a.to_string(), "/herd/f.txt", Some(b"hello"));
+    std::fs::remove_file(internal_sidecar(&srv.root).unwrap()).unwrap();
+
+    let readers: Vec<_> = (0..16)
+        .map(|i| {
+            std::thread::spawn(move || {
+                let method = if i % 2 == 0 { "GET" } else { "HEAD" };
+                let resp = request(a, method, &a.to_string(), "/herd/f.txt", None);
+                (resp.status, resp.header("etag").map(ToOwned::to_owned))
+            })
+        })
+        .collect();
+    for reader in readers {
+        let (status, etag) = reader.join().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(etag.as_deref(), Some("\"5d41402abc4b2a76b9719d911017c592\""));
+    }
+    assert!(internal_sidecar(&srv.root).is_some(), "the ETag must have been stored");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backfilled_etag_is_not_trusted_once_the_object_changes() {
+    // A backfill can race an upload and leave the old bytes' ETag in the new
+    // object's sidecar. Replacing the file behind the server's back produces the
+    // same state: a stored ETag stamped for bytes that are no longer there.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    request(a, "PUT", &a.to_string(), "/stale", None);
+    request(a, "PUT", &a.to_string(), "/stale/f.txt", Some(b"hello"));
+    std::fs::remove_file(internal_sidecar(&srv.root).unwrap()).unwrap();
+    assert_eq!(get(a, "/stale/f.txt").header("etag"), Some("\"5d41402abc4b2a76b9719d911017c592\""));
+
+    // New bytes under a new inode, as every real write produces (tmp + rename).
+    let object = srv.root.join("stale/f.txt");
+    let tmp = srv.root.join("stale/.f.txt.tmp");
+    std::fs::write(&tmp, b"goodbye, world").unwrap();
+    std::fs::rename(&tmp, &object).unwrap();
+
+    let xml = String::from_utf8_lossy(&get(a, "/stale?list-type=2").body).into_owned();
+    assert!(!xml.contains("5d41402abc4b2a76b9719d911017c592"), "listing served a stale ETag: {xml}");
+
+    let got = get(a, "/stale/f.txt");
+    assert_eq!(got.body, b"goodbye, world");
+    assert_eq!(got.header("etag"), Some("\"d7cfc28e214451a0183b3394383d943d\""));
+    let head = request(a, "HEAD", &a.to_string(), "/stale/f.txt", None);
+    assert_eq!(head.header("etag"), Some("\"d7cfc28e214451a0183b3394383d943d\""));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_object_streams_intact() {
+    // Larger than, and not a multiple of, the read chunk, so the body spans several
+    // reads and ends on a partial one.
+    let srv = spawn(false, vec![], vec![]).await;
+    let a = srv.addr;
+    let data: Vec<u8> = (0..700_001u32).map(|i| (i % 251) as u8).collect();
+    request(a, "PUT", &a.to_string(), "/big", None);
+    assert_eq!(request(a, "PUT", &a.to_string(), "/big/blob.bin", Some(&data)).status, 200);
+
+    let got = get(a, "/big/blob.bin");
+    assert_eq!(got.status, 200);
+    assert!(got.body == data, "full body differs ({} bytes back)", got.body.len());
+
+    let ranged = request_h(a, "GET", &a.to_string(), "/big/blob.bin", &[("Range", "bytes=300000-600000")], None);
+    assert_eq!(ranged.status, 206);
+    assert!(ranged.body == data[300_000..=600_000], "ranged body differs ({} bytes back)", ranged.body.len());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_objects_v2_paginates_with_continuation_token() {
     let srv = spawn(false, vec![], vec![]).await;

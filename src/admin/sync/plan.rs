@@ -11,12 +11,12 @@
 //! The obvious rule -- compare the source ETag against ours -- is both expensive
 //! and wrong here:
 //!
-//! * Our own `ListObjectsV2` never populates `e_tag`, and
-//!   [`FileSystem::object_etag`](crate::backend) only finds a stored value for
-//!   multipart-completed objects. For anything written by `put_object` it falls
-//!   through to `get_md5_sum`, which reads the whole file. A sync that heads
-//!   every key would therefore re-read every local byte on every run, which is
-//!   precisely what an incremental sync exists to avoid.
+//! * Our stored ETags cannot be relied on to exist. Objects written before ETags
+//!   were persisted have none until something reads them, and
+//!   [`FileSystem::object_etag`](crate::backend) then falls through to
+//!   `get_md5_sum`, which reads the whole file. A sync that consulted ETags for
+//!   every key could therefore re-read every local byte, which is precisely what
+//!   an incremental sync exists to avoid.
 //! * An object uploaded to the source via multipart carries a *composite* ETag
 //!   of the form `"<md5>-<parts>"`. Our `put_object` always produces a
 //!   whole-body MD5, so that value can never match. Comparing against it would
@@ -55,8 +55,8 @@ pub(crate) struct SourceObject {
 pub(crate) struct LocalObject {
     pub size: u64,
     pub modified_unix: i64,
-    /// Populated only in `verify_etag` mode, because computing it reads the
-    /// entire object off disk.
+    /// Populated only in `verify_etag` mode, because for an object without a
+    /// stored whole-body MD5 computing it reads the entire object off disk.
     pub etag: Option<String>,
 }
 

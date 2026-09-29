@@ -433,7 +433,9 @@ pub(crate) async fn preview(state: &AdminState, req: &SyncRequest) -> Result<ser
 }
 
 /// What we already hold at `key`, as a cheap `stat` -- plus the local MD5 only
-/// when the caller asked to verify ETags, since that reads the whole object.
+/// when the caller asked to verify ETags. That is the stored ETag for anything
+/// written in one piece; only a multipart object, or one whose ETag was never
+/// stored, is read in full to hash it.
 pub(crate) async fn local_view(
     state: &AdminState,
     bucket: &str,
@@ -445,7 +447,7 @@ pub(crate) async fn local_view(
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0);
-    let etag = if verify_etag { state.fs.get_md5_sum(bucket, key).await.ok() } else { None };
+    let etag = if verify_etag { state.fs.object_md5(bucket, key).await.ok() } else { None };
     Some(LocalObject { size, modified_unix, etag })
 }
 

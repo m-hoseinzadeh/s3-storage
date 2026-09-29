@@ -340,7 +340,7 @@ export function Sync() {
             />
             <Check
               label="Verify checksums"
-              hint="Re-reads every local object to compare hashes, so a run costs far more. Objects uploaded to the source in multiple parts cannot be verified this way and fall back to size and time."
+              hint="Compares each source object's MD5 with the one recorded for the local copy when it was written. Local objects with no recorded hash, or uploaded in multiple parts, are read in full to compute it, so the first run can cost far more. Objects uploaded to the source in multiple parts cannot be verified this way and fall back to size and time."
               checked={p.verifyEtag}
               onChange={(v) => set("verifyEtag", v)}
             />

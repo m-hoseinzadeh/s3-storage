@@ -11,10 +11,13 @@ use s3s::crypto::Md5;
 use s3s::dto;
 use s3s::dto::PartNumber;
 
+use std::collections::HashMap;
 use std::env;
+use std::fs::Metadata;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use tokio::fs;
@@ -28,6 +31,54 @@ use uuid::Uuid;
 pub struct FileSystem {
     pub(crate) root: PathBuf,
     tmp_file_counter: AtomicU64,
+    /// Serializes ETag backfills per object; see `resolve_etag`.
+    pub(crate) etag_locks: KeyLocks,
+}
+
+/// One async lock per path, held in the map only while someone holds or waits
+/// for it, so the map stays as small as the set of paths currently contended.
+#[derive(Debug, Default)]
+pub(crate) struct KeyLocks {
+    locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl KeyLocks {
+    /// Wait for exclusive use of `path`. Released when the guard drops; a request
+    /// cancelled while still waiting cleans up after itself the same way.
+    pub(crate) async fn lock(&self, path: &Path) -> KeyGuard<'_> {
+        let entry = KeyEntry {
+            lock: Arc::clone(self.locks.lock().unwrap().entry(path.to_owned()).or_default()),
+            locks: self,
+            path: path.to_owned(),
+        };
+        let guard = Arc::clone(&entry.lock).lock_owned().await;
+        KeyGuard { _guard: guard, _entry: entry }
+    }
+}
+
+/// Holds the lock. Fields drop in order: the mutex is released first, then the
+/// entry decides whether the map still needs it.
+pub(crate) struct KeyGuard<'a> {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _entry: KeyEntry<'a>,
+}
+
+/// One holder's or waiter's reference to a path's lock.
+struct KeyEntry<'a> {
+    locks: &'a KeyLocks,
+    path: PathBuf,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for KeyEntry<'_> {
+    fn drop(&mut self) {
+        let mut locks = self.locks.locks.lock().unwrap();
+        // Every holder and waiter clones the `Arc` under this map lock, so the
+        // count is stable here: two means only the map and this entry are left.
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.path);
+        }
+    }
 }
 
 pub(crate) type InternalInfo = serde_json::Map<String, serde_json::Value>;
@@ -98,6 +149,54 @@ pub(crate) async fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+/// Sidecar field recording which bytes a *backfilled* ETag was computed from.
+///
+/// Write paths store the ETag together with the bytes, so theirs is trusted as is.
+/// A read that finds none computes it later and stores it, but by then an upload
+/// may have replaced the object and written its own sidecar, which the backfill
+/// would then overwrite with the old bytes' ETag and checksums. The stamp lets a
+/// later read notice that and throw the stale sidecar away instead of serving it.
+pub(crate) const ETAG_STAMP: &str = "etag_stamp";
+
+/// Identifies one version of an object file. Every write lands via tmp + rename,
+/// so a rewrite always gets a new inode even when size and mtime collide.
+pub(crate) fn etag_stamp(meta: &Metadata) -> String {
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    format!("{}:{ino}:{mtime}", meta.len())
+}
+
+/// The ETag in `info`, unless it was backfilled for bytes other than the ones
+/// `meta` describes -- in which case the whole sidecar describes another object.
+pub(crate) fn stored_etag<'a>(info: &'a InternalInfo, meta: &Metadata) -> Option<&'a str> {
+    if let Some(stamp) = info.get(ETAG_STAMP).and_then(|v| v.as_str())
+        && stamp != etag_stamp(meta)
+    {
+        return None;
+    }
+    info.get("etag")?.as_str()
+}
+
+/// Read `path`, treating "not there" as `None`.
+///
+/// Every GET reads two sidecars through here, so it must not pre-check with the
+/// synchronous `Path::exists`: that is a blocking `stat` on an async worker
+/// thread, and under load it stalls the runtime on disk latency.
+async fn read_if_exists(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn clean_old_tmp_files(root: &Path) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => Ok(entries),
@@ -121,7 +220,11 @@ impl FileSystem {
         let root = env::current_dir()?.join(root).canonicalize()?;
         clean_old_tmp_files(&root)?;
         let tmp_file_counter = AtomicU64::new(0);
-        Ok(Self { root, tmp_file_counter })
+        Ok(Self {
+            root,
+            tmp_file_counter,
+            etag_locks: KeyLocks::default(),
+        })
     }
 
     /// The canonicalized data root. Used to locate sidecar state (e.g. the
@@ -194,10 +297,7 @@ impl FileSystem {
         upload_id: Option<Uuid>,
     ) -> Result<Option<ObjectAttributes>> {
         let path = self.get_metadata_path(bucket, key, upload_id)?;
-        if path.exists().not() {
-            return Ok(None);
-        }
-        let content = fs::read(&path).await?;
+        let Some(content) = read_if_exists(&path).await? else { return Ok(None) };
 
         // Try to deserialize as ObjectAttributes first (new format)
         if let Ok(attrs) = serde_json::from_slice::<ObjectAttributes>(&content) {
@@ -255,10 +355,7 @@ impl FileSystem {
 
     pub(crate) async fn load_internal_info(&self, bucket: &str, key: &str) -> Result<Option<InternalInfo>> {
         let path = self.get_internal_info_path(bucket, key)?;
-        if path.exists().not() {
-            return Ok(None);
-        }
-        let content = fs::read(&path).await?;
+        let Some(content) = read_if_exists(&path).await? else { return Ok(None) };
         let map = serde_json::from_slice(&content)?;
         Ok(Some(map))
     }
@@ -280,12 +377,15 @@ impl FileSystem {
     /// hash is persisted at write time and simply read back here.
     ///
     /// Objects written before it was persisted have no stored ETag and list without
-    /// one, rather than making every listing pay to backfill them; rewriting such an
-    /// object gives it one. Errors are swallowed for the same reason -- a listing
-    /// should not fail because one sidecar is unreadable.
-    pub(crate) async fn load_etag(&self, bucket: &str, key: &str) -> Option<String> {
+    /// one, rather than making every listing pay to backfill them; the first GET or
+    /// HEAD of such an object stores one. Errors are swallowed for the same reason
+    /// -- a listing should not fail because one sidecar is unreadable.
+    ///
+    /// `meta` is the object file's metadata, which the listing already holds; a
+    /// backfilled ETag that no longer matches it is not reported (see [`stored_etag`]).
+    pub(crate) async fn load_etag(&self, bucket: &str, key: &str, meta: &Metadata) -> Option<String> {
         let info = self.load_internal_info(bucket, key).await.ok()??;
-        info.get("etag")?.as_str().map(ToOwned::to_owned)
+        stored_etag(&info, meta).map(ToOwned::to_owned)
     }
 
     /// get md5 sum
@@ -350,8 +450,6 @@ impl FileSystem {
     /// present) to recover the target bucket/key, using the marker's mtime as the
     /// initiation time.
     pub(crate) async fn list_multipart_uploads(&self) -> Result<Vec<MultipartUploadInfo>> {
-        use std::collections::HashMap;
-
         let decode = |s: &str| -> Option<String> {
             base64_simd::URL_SAFE_NO_PAD
                 .decode_to_vec(s)
@@ -519,5 +617,45 @@ impl Drop for FileWriter<'_> {
         if self.clean_tmp {
             let _ = std::fs::remove_file(&self.tmp_path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn key_locks_exclude_per_path_and_forget_released_paths() {
+        let locks = Arc::new(KeyLocks::default());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (locks, inside) = (Arc::clone(&locks), Arc::clone(&inside));
+                tokio::spawn(async move {
+                    let _guard = locks.lock(Path::new("a")).await;
+                    assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders at once");
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(locks.locks.lock().unwrap().is_empty(), "released paths must leave the map");
+    }
+
+    #[tokio::test]
+    async fn a_waiter_cancelled_before_it_gets_the_lock_leaves_nothing_behind() {
+        let locks = KeyLocks::default();
+        let held = locks.lock(Path::new("a")).await;
+        // Give up on the second lock while the first is still held.
+        let waited = tokio::time::timeout(Duration::from_millis(10), locks.lock(Path::new("a"))).await;
+        assert!(waited.is_err());
+        drop(held);
+        assert!(locks.locks.lock().unwrap().is_empty(), "a cancelled waiter must not leak its entry");
     }
 }

@@ -401,6 +401,31 @@ async fn a_same_size_edit_with_a_newer_source_is_recopied() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_etag_catches_a_same_size_edit_that_time_says_is_synced() {
+    let f = spawn().await;
+    f.seed_bucket("ver");
+    f.seed_object("ver", "k", b"aaaa", "text/plain");
+    f.make_dest_bucket("ver");
+    assert_eq!(n(&f.run_sync(&f.sync_body("ver", "ver", "")), "copied"), 1);
+
+    // Same size, and a skew wide enough that size + time call it up to date.
+    f.seed_object("ver", "k", b"zzzz", "text/plain");
+    let by_time = f.post_sync("/api/sync/preview", &f.sync_body("ver", "ver", r#","skew_secs":3600"#)).json();
+    assert_eq!(by_time["to_copy"], 0, "{by_time}");
+
+    // The MD5 recorded when our copy was written tells them apart.
+    let verify = r#","skew_secs":3600,"verify_etag":true"#;
+    let preview = f.post_sync("/api/sync/preview", &f.sync_body("ver", "ver", verify)).json();
+    assert_eq!(preview["actions"][0]["reason"], "etag_differs", "{preview}");
+    let job = f.run_sync(&f.sync_body("ver", "ver", verify));
+    assert_eq!(n(&job, "copied"), 1, "{job}");
+    assert_eq!(f.get_body("ver", "k"), b"zzzz");
+
+    let again = f.post_sync("/api/sync/preview", &f.sync_body("ver", "ver", verify)).json();
+    assert_eq!(again["actions"][0]["reason"], "etag_matches", "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn skip_existing_and_overwrite_all_bracket_the_default_mode() {
     let f = spawn().await;
     f.seed_bucket("modes");
