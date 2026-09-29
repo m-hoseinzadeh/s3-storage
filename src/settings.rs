@@ -224,11 +224,16 @@ impl SettingsStore {
     /// ensure the schema exists, and load the current values into memory.
     pub fn open(root: &Path) -> io::Result<SharedSettings> {
         let dir = root.join(".s3-storage");
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            if is_access_io_error(&e) { access_error(root, &dir, &e) } else { e }
+        })?;
         let path = dir.join("settings.db");
-        let conn = Connection::open(&path).map_err(io::Error::other)?;
-        init_schema(&conn).map_err(io::Error::other)?;
-        let settings = load_settings(&conn).map_err(io::Error::other)?;
+        let sqlite_err = |e: rusqlite::Error| {
+            if is_access_sqlite_error(&e) { access_error(root, &dir, &e) } else { io::Error::other(e) }
+        };
+        let conn = Connection::open(&path).map_err(sqlite_err)?;
+        init_schema(&conn).map_err(sqlite_err)?;
+        let settings = load_settings(&conn).map_err(sqlite_err)?;
         Ok(Arc::new(Self {
             conn: Mutex::new(conn),
             snapshot: RwLock::new(Snapshot::build(settings)),
@@ -333,6 +338,83 @@ impl SettingsStore {
         *self.snapshot.write().unwrap() = Snapshot::build(settings);
         Ok(())
     }
+}
+
+/// Whether opening the settings store failed because we may not write there.
+fn is_access_io_error(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem)
+}
+
+fn is_access_sqlite_error(err: &rusqlite::Error) -> bool {
+    use rusqlite::ErrorCode::{CannotOpen, PermissionDenied, ReadOnly};
+    matches!(err, rusqlite::Error::SqliteFailure(e, _) if matches!(e.code, ReadOnly | CannotOpen | PermissionDenied))
+}
+
+/// Turn "cannot write the settings DB" into an error that says why and what to
+/// do. The settings store is the first thing at startup that writes under the
+/// data root, so this is where a volume the server cannot write surfaces -- and
+/// SQLite's own "attempt to write a readonly database" names neither the file nor
+/// the cause.
+///
+/// The usual cause is ownership: a volume first created by an older image that ran
+/// as root stays root-owned after the image moves to a non-root user, because
+/// Docker applies the image's ownership only when it creates the volume.
+fn access_error(root: &Path, dir: &Path, err: &dyn std::fmt::Display) -> io::Error {
+    let me = process_owner();
+    let foreign = [dir.to_owned(), dir.join("settings.db"), dir.join("settings.db-wal"), dir.join("settings.db-shm")]
+        .into_iter()
+        .find_map(|path| {
+            let (owner, _) = file_owner(&path)?;
+            (Some(owner) != me.map(|(uid, _)| uid)).then_some((path, owner))
+        });
+    io::Error::new(io::ErrorKind::PermissionDenied, describe_access_error(root, dir, err, me, foreign))
+}
+
+fn describe_access_error(
+    root: &Path,
+    dir: &Path,
+    err: &dyn std::fmt::Display,
+    me: Option<(u32, u32)>,
+    foreign: Option<(std::path::PathBuf, u32)>,
+) -> String {
+    let mut msg = format!("cannot write the settings database in {}: {err}", dir.display());
+    match (me, foreign) {
+        (Some((uid, gid)), Some((path, owner))) => msg.push_str(&format!(
+            "\n  {} is owned by uid {owner}, but the server runs as uid {uid}. A data volume \
+             first created by an older image that ran as root keeps root ownership after \
+             the image moves to a non-root user. Fix it once with:\n    chown -R {uid}:{gid} {}",
+            path.display(),
+            root.display(),
+        )),
+        (Some((uid, _)), None) => msg.push_str(&format!(
+            "\n  The server runs as uid {uid} and needs write access to {} and the files in \
+             it; check their permissions, and that the volume is not mounted read-only.",
+            dir.display(),
+        )),
+        (None, _) => msg.push_str(&format!(
+            "\n  The server needs write access to {} and the files in it; check their \
+             ownership and permissions, and that the volume is not mounted read-only.",
+            dir.display(),
+        )),
+    }
+    msg
+}
+
+/// The (uid, gid) this process runs as, read from `/proc/self`, which the kernel
+/// shows as owned by the process's effective ids. `None` off Linux.
+fn process_owner() -> Option<(u32, u32)> {
+    file_owner(Path::new("/proc/self"))
+}
+
+#[cfg(unix)]
+fn file_owner(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+}
+
+#[cfg(not(unix))]
+fn file_owner(_: &Path) -> Option<(u32, u32)> {
+    None
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -499,4 +581,55 @@ fn normalize_domain_map(entries: &[String]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_owned_volume_is_explained_with_the_fix() {
+        let msg = describe_access_error(
+            Path::new("/data"),
+            Path::new("/data/.s3-storage"),
+            &"attempt to write a readonly database",
+            Some((65532, 65532)),
+            Some((Path::new("/data/.s3-storage/settings.db").to_owned(), 0)),
+        );
+        assert!(msg.contains("/data/.s3-storage"), "{msg}");
+        assert!(msg.contains("attempt to write a readonly database"), "{msg}");
+        assert!(msg.contains("settings.db is owned by uid 0, but the server runs as uid 65532"), "{msg}");
+        assert!(msg.contains("chown -R 65532:65532 /data"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_settings_dir_fails_with_the_path_and_a_hint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if process_owner().is_some_and(|(uid, _)| uid == 0) {
+            return; // root ignores permission bits, so there is nothing to refuse
+        }
+        let root = std::env::temp_dir().join(format!("s3-storage-settings-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        drop(SettingsStore::open(&root).unwrap());
+
+        let dir = root.join(".s3-storage");
+        let set_mode = |mode| {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                std::fs::set_permissions(entry.unwrap().path(), std::fs::Permissions::from_mode(mode & 0o666)).unwrap();
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o555);
+        let result = SettingsStore::open(&root);
+        set_mode(0o755);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let err = result.expect_err("an unwritable settings dir must fail to open");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("cannot write the settings database in {}", dir.display())), "{msg}");
+        assert!(msg.contains("needs write access"), "{msg}");
+    }
 }
